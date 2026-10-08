@@ -1,0 +1,210 @@
+# LiteBrowser
+
+給記憶體很少的 Windows（例如 VDI）用的輕量分頁瀏覽器。
+介面用 Rust + [Slint](https://slint.dev) 寫，網頁引擎用系統內建的 Microsoft Edge WebView2。
+
+省記憶體的方式是：**同一時間只讓少數分頁真的活著**，其他分頁凍結或釋放。
+
+## 安裝與執行
+
+1. 下載 `LiteBrowser-windows-x64.zip`
+   - 正式版：GitHub 的 **Releases** 頁面
+   - 測試版：GitHub **Actions** → 最新一次 Build → 頁面最下方的 Artifacts
+2. 解壓縮，執行 `LiteBrowser.exe`（單一執行檔，不用安裝）
+3. 需要 **Microsoft Edge WebView2 Runtime**。Windows 11 內建；Windows 10 通常已隨 Edge 安裝。
+   如果開啟時出現找不到 WebView2 的訊息，請安裝：<https://go.microsoft.com/fwlink/p/?LinkId=2124703>
+
+## 分頁的狀態
+
+分頁標題左邊的小圓點：
+
+| 圓點 | 意思 | 記憶體 |
+|---|---|---|
+| 綠色 | 正在執行 | 正常 |
+| 藍色 | 載入中 | 正常 |
+| 淺灰 | 已凍結（背景超過 30 秒） | 較少 |
+| 空心 | 已釋放（背景超過 15 分鐘，或超過上限） | 幾乎為 0，點回來會重新載入 |
+
+- 預設最多 **2 個**分頁保留網頁（含目前分頁），超過時最久沒用的分頁會被釋放。
+- 總記憶體超過上限（預設 500 MB）時，會再釋放最久沒用的背景分頁。
+- **在分頁上按滑鼠右鍵 →「釘選」**。釘選的分頁只會凍結、不會被釋放（適合信箱、ClickUp 這類想一直開著的頁面）。
+- 中鍵點分頁＝關閉。Ctrl＋點連結（或中鍵點連結）會開成「已釋放」的背景分頁，點過去才載入，不佔記憶體。
+- 右下角狀態列顯示整個瀏覽器（含 WebView2 所有程序）實際用掉的記憶體。
+
+> 注意：被釋放的分頁重新載入後，尚未送出的表單內容會不見。正在輸入重要內容的分頁請先釘選。
+
+- 關閉**最後一個**分頁會直接關閉瀏覽器（和 Chrome 一樣），而且**下次啟動是空白分頁**；
+  想保留分頁下次繼續，請用視窗右上角的 X 關閉。
+- 分頁上按右鍵會跳出選單：釘選、複製分頁、重新載入、往左／往右移、關閉、關閉其他、關閉右側、重新開啟。
+- 釘選的分頁會縮小成只剩圖示，並固定排在最左邊。
+
+## 快捷鍵
+
+| 按鍵 | 功能 |
+|---|---|
+| Ctrl+T / Ctrl+N | 新分頁 |
+| Ctrl+W / Ctrl+F4 | 關閉分頁 |
+| Ctrl+Shift+T | 重新開啟剛關閉的分頁 |
+| Ctrl+Shift+N | 開新無痕分頁（不留 Cookie、歷史與快取） |
+| Ctrl+Tab / Ctrl+Shift+Tab | 下一個 / 上一個分頁 |
+| Ctrl+1 … Ctrl+8 / Ctrl+9 | 切到第 N 個 / 最後一個分頁 |
+| Ctrl+L / Alt+D / F6 | 網址列 |
+| Ctrl+D | 加入 / 移除書籤 |
+| Ctrl+H | 歷史紀錄 |
+| Ctrl+Shift+O | 書籤 |
+| Ctrl+J | 下載清單 |
+| F12 / Ctrl+Shift+I | 開發人員工具（停駐在下方或右側） |
+| F11 | 全螢幕（Esc 離開） |
+| F5 / Ctrl+R | 重新整理 |
+| Alt+← / Alt+→ | 上一頁 / 下一頁 |
+| Ctrl+F | 頁內搜尋（WebView2 內建） |
+| Ctrl+＋ / Ctrl+－ | 縮放 |
+
+## 功能
+
+- 分頁、書籤（含書籤列，顯示圖示與名稱；沒有名稱就只顯示圖示，可直接編輯名稱與網址）、
+  歷史紀錄、網址列建議（書籤＋歷史＋搜尋）、網站圖示（favicon）
+- 下載：使用 WebView2 內建的下載清單（Ctrl+J 或工具列的下載按鈕）
+- 密碼與表單自動填入：WebView2 內建，第一次登入時會詢問是否儲存
+- 廣告／追蹤網域封鎖：內建一份小清單，可在 `blocklist.txt` 自行增加
+- 擴充功能：可直接貼 Chrome 線上應用程式商店網址安裝，也支援手動放解壓縮後的資料夾（見下方）
+- 無痕分頁：Ctrl+Shift+N 或分頁右鍵選單。分頁會變深色並顯示面具圖示，關掉後不留 Cookie、
+  歷史紀錄或快取，也不會被記進下次要恢復的分頁
+- 關閉時記住分頁，下次開啟時恢復（恢復的分頁都是「已釋放」狀態，不佔記憶體）
+- 分頁直接貼在視窗最上方（沒有系統標題列）：拖曳分頁列空白處可移動視窗，double-click 最大化，
+  右上角有最小化／最大化／關閉
+- 停駐式開發人員工具：F12 會在網頁**下方或右側**開啟（不再是另開視窗）。拖曳分隔線可調整大小；
+  在分隔線上按**右鍵**可切換停駐位置或關閉，設定頁也有「開發人員工具停駐在右側」選項
+- 全螢幕：網頁自己要求全螢幕時（YouTube 等影片播放器）會自動隱藏所有工具列，網頁佔滿整個螢幕；
+  F11 也可以自己切換，Esc 離開
+
+## 自動更新
+
+啟動時會到 GitHub 看有沒有新版，有的話在背景下載好，並在上方顯示「重新啟動即可更新」。
+下次啟動時會在開視窗之前把執行檔換掉，然後自動重開。
+
+Windows 不允許覆寫執行中的程式，但允許「改名」，所以更新是：把舊的改名移開 → 新的放進原位 →
+重新啟動 → 下次啟動時刪掉改名的舊檔。中途失敗會把舊的放回去，不會變成開不起來。
+不想要的話把 `auto_update` 設成 `false`。
+
+## 讓 LLM 操作（MCP）
+
+設定頁勾選「開啟 MCP 服務」後重新啟動，LiteBrowser 會在本機開一個 MCP 端點，Claude 等支援 MCP 的
+用戶端可以直接操作這個瀏覽器：列出分頁、開分頁、前往網址、上一頁／下一頁、重新整理、讀取頁面文字或
+HTML、執行 JavaScript（可用來點按鈕、填表單）、截圖（只能截畫面上正在顯示的分頁，背景分頁要先切過去）。
+
+- 網址長這樣：`http://127.0.0.1:<port>/mcp/<token>`，會顯示在設定頁，也會寫進資料夾的 `mcp-url.txt`。
+- **只接受本機連線**，而且網址帶一次性的 token，每次啟動都會換，避免其他程式亂連。
+- 預設關閉。
+
+## 從其他瀏覽器匯入
+
+設定（☰）→「從其他瀏覽器匯入…」，或直接開啟匯入頁。
+
+- **書籤、歷史紀錄**：會自動偵測 Chrome、Edge、Brave、Firefox 的設定檔，勾選後直接匯入。**匯入前請先關閉該瀏覽器。**
+- **密碼**：基於安全考量，不直接讀取其他瀏覽器的密碼資料庫，而是用「你自己匯出的 CSV」：
+  1. 在原瀏覽器的密碼設定選「匯出密碼」（會要求你驗證身分），存成 CSV。
+  2. 在匯入頁按「選擇密碼 CSV 檔」。
+  3. **重新啟動 LiteBrowser** 一次，密碼就會寫入並可自動填入。
+  這種做法也能正確處理 Chrome 新版的 app-bound 加密（直接讀取會失敗）。
+- 登入用的 Cookie 不會轉移；匯入密碼後，第一次登入各網站用自動填入一鍵帶入即可。
+
+## 擴充功能
+
+### 從 Chrome 線上應用程式商店安裝
+
+1. 工具列的拼圖按鈕 → 開啟擴充功能頁
+2. 把商店頁面的網址貼進輸入框，按「安裝」
+
+   例：`https://chromewebstore.google.com/detail/read-frog-translate-learn/modkelfkcfjpgbfmnbnllalkiogfofhb`
+   （貼擴充功能 ID 本身也可以。）
+3. 下載完會自動安裝，重新整理網頁後生效
+
+LiteBrowser 會向商店要 `.crx`，解開成一個資料夾放在 `extensions\<擴充功能 ID>`，再交給 WebView2 載入。
+之後每次啟動都會沿用，不需要重新下載。
+
+### 手動放資料夾
+
+商店上沒有、或是想裝自己改過的版本時：
+
+1. 擴充功能頁 → 「開啟擴充功能資料夾」
+2. 把解壓縮後的擴充功能資料夾（裡面要有 `manifest.json`）放進去
+3. 按「重新載入」
+
+例：uBlock Origin Lite → 到 <https://github.com/uBlockOrigin/uBOL-home/releases> 下載 `uBOLite_x.x.x.chromium.zip`，解壓縮成一個資料夾放進去。
+
+限制：WebView2 不會顯示擴充功能的工具列按鈕，所以需要點按鈕才能用的擴充功能（例如密碼管理器的彈出視窗）無法使用。
+
+## 資料位置
+
+預設在 `%LOCALAPPDATA%\LiteBrowser`：
+
+| 檔案 | 內容 |
+|---|---|
+| `config.toml` | 設定（也可以在 ☰ 設定頁修改） |
+| `bookmarks.json`、`history.json`、`session.json` | 書籤、歷史紀錄、上次的分頁 |
+| `blocklist.txt` | 自訂封鎖網域，每行一個 |
+| `favicons\` | 網站圖示快取 |
+| `extensions\` | 擴充功能資料夾 |
+| `webview2\` | Cookie、快取、儲存的密碼 |
+| `pending-import.json` | 等待下次啟動寫入的密碼 CSV 清單 |
+| `litebrowser.log` | 錯誤紀錄（有問題時請附上） |
+
+**可攜模式**：在 `LiteBrowser.exe` 旁邊建立 `portable.txt`（或 `data` 資料夾），資料就會放在 exe 旁的 `data\`。
+如果 VDI 登出後 `%LOCALAPPDATA%` 會被清空，請改用可攜模式並把 exe 放在會保留的磁碟（例如個人網路磁碟）。
+也可以用環境變數 `LITEBROWSER_DATA` 指定資料夾。
+
+## 設定（config.toml）
+
+| 設定 | 預設 | 說明 |
+|---|---|---|
+| `max_live_tabs` | 2 | 同時保留網頁的分頁數（含目前分頁） |
+| `suspend_after_secs` | 30 | 背景分頁幾秒後凍結 |
+| `discard_after_mins` | 15 | 背景分頁幾分鐘後釋放 |
+| `memory_budget_mb` | 500 | 記憶體上限 |
+| `adblock` | true | 封鎖廣告／追蹤網域（重新啟動後生效） |
+| `disable_gpu` | false | 在沒有顯示卡的機器上停用 GPU 可省約 240 MB（實測 GPU 程序 258 MB → 18 MB），但 WebGL 會改由 SwiftShader 提供，部分網站的機器人驗證可能因此起疑，所以預設不停用（重新啟動後生效） |
+| `restore_session` | true | 啟動時恢復上次的分頁 |
+| `show_bookmarks_bar` | true | 顯示書籤列 |
+| `search_url` | Google | 搜尋網址，`{}` 會換成搜尋文字 |
+| `discard_grace_mins` | 5 | 剛看過的分頁在這幾分鐘內不會因為上限或記憶體而被釋放（避免切來切去一直重載） |
+| `low_memory_free_mb` | 250 | 整台機器可用記憶體低於這個值時，立刻釋放背景分頁 |
+| `devtools_dock_right` | false | 開發人員工具停駐在右側（false＝下方） |
+| `auto_update` | true | 啟動時檢查 GitHub 有沒有新版，有就先下載好 |
+| `mcp_enabled` | false | 開啟 MCP 服務讓 LLM 操作（重新啟動後生效） |
+| `mcp_port` | 0 | MCP 連接埠，0＝自動選一個沒被用的 |
+| `extra_browser_args` | 空 | 額外的 Chromium 參數（進階） |
+
+## 開發
+
+```sh
+cargo test                     # 核心邏輯的單元測試（任何平台都能跑）
+cargo build --release          # 只能在 Windows 上產生可執行檔
+```
+
+程式結構：
+
+| 檔案 | 內容 |
+|---|---|
+| `ui/app.slint` | 整個介面 |
+| `src/app.rs` | 分頁、事件處理、把狀態推到介面 |
+| `src/webview.rs` | WebView2 封裝（建立、事件、凍結、擴充功能、封鎖） |
+| `src/crx.rs` | 從 Chrome 線上應用程式商店下載並解開 `.crx` |
+| `src/tabs.rs` | 凍結／釋放策略（純邏輯，有測試） |
+| `src/memory.rs` | 計算整個瀏覽器程序樹的記憶體 |
+| `src/win.rs` | Slint 視窗與 WebView2 子視窗之間的 Win32 處理 |
+| 其他 | 設定、書籤／歷史、網址判斷、快捷鍵、封鎖清單 |
+
+### 發佈
+
+每次 push，GitHub Actions 都會在 Windows 上建置並把 exe 存成 Artifact，可以先下載測試。
+確認可用後打 tag 推上去，就會自動建立 Release：
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+## 授權
+
+GPL-3.0-only（見 `LICENSE`）。介面使用 Slint，並以其 GPL-3.0 授權條款使用。

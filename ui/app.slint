@@ -1,0 +1,1723 @@
+// LiteBrowser main window.
+//
+// The web page itself is a native WebView2 child window that Rust places over the `content`
+// rectangle. Anything drawn by Slint inside `content` (internal pages, address suggestions) is only
+// visible while Rust keeps the WebView hidden, so nothing here pops up over the content area.
+
+import { LineEdit, Button, ListView, ScrollView, CheckBox, SpinBox, Palette } from "std-widgets.slint";
+
+export enum Page { web, new-tab, bookmarks, history, extensions, settings, import }
+
+export struct TabData {
+    title: string,
+    url: string,
+    loading: bool,
+    discarded: bool,
+    suspended: bool,
+    pinned: bool,
+    favicon: image,
+    private: bool,
+}
+
+export struct LinkData {
+    title: string,
+    url: string,
+    detail: string,
+    favicon: image,
+}
+
+export struct ImportProfileData {
+    // Stable id Rust uses to find the profile again.
+    id: int,
+    label: string,
+    selected: bool,
+}
+
+export struct SuggestionData {
+    title: string,
+    url: string,
+    // "search", "url", "bookmark" or "history"
+    kind: string,
+}
+
+export struct ExtensionData {
+    id: string,
+    name: string,
+    enabled: bool,
+}
+
+export struct SettingsData {
+    max-live-tabs: int,
+    suspend-after-secs: int,
+    discard-after-mins: int,
+    memory-budget-mb: int,
+    adblock: bool,
+    disable-gpu: bool,
+    restore-session: bool,
+    show-bookmarks-bar: bool,
+    search-url: string,
+    devtools-dock-right: bool,
+    mcp-enabled: bool,
+}
+
+global Theme {
+    out property <color> chrome: #eef0f3;
+    out property <color> surface: #ffffff;
+    out property <color> text: #1b1b1b;
+    out property <color> dim: #6b6b6b;
+    out property <color> hover: #0000000f;
+    out property <color> pressed: #0000001f;
+    out property <color> border: #d9dce1;
+    out property <color> accent: #0f6cbd;
+    out property <color> danger: #c42b1c;
+}
+
+global Icons {
+    out property <string> back: "M 19 12 L 5 12 M 11 6 L 5 12 L 11 18";
+    out property <string> forward: "M 5 12 L 19 12 M 13 6 L 19 12 L 13 18";
+    out property <string> reload: "M 19 12 A 7 7 0 1 1 16.9 7 M 19 3.5 L 19 7.5 L 15 7.5";
+    out property <string> close: "M 6 6 L 18 18 M 18 6 L 6 18";
+    out property <string> plus: "M 12 5 L 12 19 M 5 12 L 19 12";
+    out property <string> star: "M 12 3.5 L 14.6 8.8 L 20.4 9.6 L 16.2 13.7 L 17.2 19.5 L 12 16.8 L 6.8 19.5 L 7.8 13.7 L 3.6 9.6 L 9.4 8.8 Z";
+    out property <string> bookmarks: "M 6 3.5 L 18 3.5 L 18 20.5 L 12 16 L 6 20.5 Z";
+    out property <string> history: "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 12 7 L 12 12 L 15.5 14";
+    out property <string> download: "M 12 4 L 12 15 M 7 10 L 12 15 L 17 10 M 5 19.5 L 19 19.5";
+    out property <string> puzzle: "M 4 8 L 9 8 A 2.2 2.2 0 1 1 13 8 L 17 8 L 17 12 A 2.2 2.2 0 1 1 17 16 L 17 20 L 4 20 Z";
+    out property <string> menu: "M 4 6.5 L 20 6.5 M 4 12 L 20 12 M 4 17.5 L 20 17.5";
+    out property <string> pin: "M 9 4 L 15 4 M 10 4 L 10 10 L 7 13 L 17 13 L 14 10 L 14 4 M 12 13 L 12 20";
+    out property <string> search: "M 4 10 A 6 6 0 1 0 16 10 A 6 6 0 1 0 4 10 M 14.5 14.5 L 20 20";
+    out property <string> globe: "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 3.5 12 L 20.5 12 M 12 3.5 A 5 8.5 0 0 0 12 20.5 A 5 8.5 0 0 0 12 3.5";
+    out property <string> import: "M 12 3 L 12 15 M 7 10 L 12 15 L 17 10 M 4 20 L 20 20";
+    out property <string> edit: "M 4 20 L 8 19 L 19.5 7.5 A 2 2 0 0 0 16.5 4.5 L 5 16 Z M 15 6 L 18 9";
+    // Caption glyphs, drawn in a 10x10 box.
+    out property <string> private: "M 2 9 L 22 9 M 3 9 A 4.5 4.5 0 0 0 10 15 L 14 15 A 4.5 4.5 0 0 0 21 9 M 7 9 L 9 5 L 15 5 L 17 9";
+    out property <string> caption-minimize: "M 0 5 L 10 5";
+    out property <string> caption-maximize: "M 0.5 0.5 L 9.5 0.5 L 9.5 9.5 L 0.5 9.5 Z";
+    out property <string> caption-restore: "M 0.5 2.5 L 7.5 2.5 L 7.5 9.5 L 0.5 9.5 Z M 2.5 2.5 L 2.5 0.5 L 9.5 0.5 L 9.5 7.5 L 7.5 7.5";
+    out property <string> caption-close: "M 0.5 0.5 L 9.5 9.5 M 9.5 0.5 L 0.5 9.5";
+    out property <string> devtools: "M 4 5 L 20 5 L 20 19 L 4 19 Z M 4 10 L 20 10 M 8 14 L 11 14";
+}
+
+component IconButton inherits Rectangle {
+    in property <string> icon;
+    in property <bool> enabled: true;
+    // Draws the icon filled in the accent color (e.g. a bookmarked star).
+    in property <bool> highlighted;
+    in property <length> size: 30px;
+    callback clicked;
+
+    width: root.size;
+    height: root.size;
+    border-radius: 4px;
+    background: !root.enabled ? transparent : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 16px;
+        height: 16px;
+        viewbox-width: 24;
+        viewbox-height: 24;
+        commands: root.icon;
+        stroke: !root.enabled ? Theme.border : root.highlighted ? Theme.accent : Theme.text;
+        fill: root.highlighted ? Theme.accent : transparent;
+        stroke-width: 1.6px;
+        stroke-line-cap: round;
+        stroke-line-join: round;
+    }
+}
+
+component WindowButton inherits Rectangle {
+    in property <string> icon;
+    in property <bool> danger;
+    callback clicked;
+
+    width: 46px;
+    background: touch.pressed
+        ? (root.danger ? #b01b14 : Theme.pressed)
+        : touch.has-hover ? (root.danger ? Theme.danger : Theme.hover) : transparent;
+
+    touch := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    Path {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 10px;
+        height: 10px;
+        viewbox-width: 10;
+        viewbox-height: 10;
+        commands: root.icon;
+        stroke: root.danger && touch.has-hover ? #ffffff : Theme.text;
+        stroke-width: 1px;
+    }
+}
+
+component TabItem inherits Rectangle {
+    in property <TabData> tab;
+    in property <bool> active;
+    // Pinned tabs render compact: favicon only, no title or close button.
+    in property <bool> compact;
+    callback clicked;
+    callback close;
+    callback context-menu;
+
+    border-radius: 6px;
+    background: root.tab.private
+        ? (root.active ? #3b3b46 : touch.has-hover ? #4a4a57 : #44444f)
+        : (root.active ? Theme.surface : touch.has-hover ? Theme.hover : transparent);
+
+    touch := TouchArea {
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+                root.close();
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                root.context-menu();
+            }
+        }
+        clicked => {
+            root.clicked();
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: root.compact ? 0px : 8px;
+        padding-right: root.compact ? 0px : 2px;
+        spacing: 6px;
+        alignment: root.compact ? LayoutAlignment.center : LayoutAlignment.stretch;
+
+        // Favicon when known; otherwise a state dot. Private tabs show a mask instead.
+        VerticalLayout {
+            alignment: center;
+            if root.tab.private: Path {
+                width: 15px;
+                height: 15px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: Icons.private;
+                stroke: #d8d8e4;
+                stroke-width: 1.5px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            if !root.tab.private && root.tab.favicon.width > 0 && !root.tab.loading: Image {
+                source: root.tab.favicon;
+                width: 16px;
+                height: 16px;
+                image-fit: contain;
+            }
+            // State dot: green = running, blue = loading, light grey = frozen, hollow = discarded.
+            if !root.tab.private && (root.tab.favicon.width == 0 || root.tab.loading): Rectangle {
+                width: 8px;
+                height: 8px;
+                border-radius: 4px;
+                background: root.tab.loading ? Theme.accent : root.tab.discarded ? transparent : root.tab.suspended ? Theme.border : #3a9d5d;
+                border-width: root.tab.discarded ? 1px : 0px;
+                border-color: Theme.dim;
+            }
+        }
+
+        if root.tab.pinned && !root.compact: VerticalLayout {
+            alignment: center;
+            Path {
+                width: 12px;
+                height: 12px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: Icons.pin;
+                stroke: Theme.accent;
+                stroke-width: 1.6px;
+                stroke-line-cap: round;
+            }
+        }
+
+        if !root.compact: Text {
+            text: root.tab.title != "" ? root.tab.title : root.tab.url != "" ? root.tab.url : root.tab.private ? "無痕分頁" : "新分頁";
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+            color: root.tab.private ? #e8e8f0 : root.tab.discarded ? Theme.dim : Theme.text;
+        }
+
+        if !root.tab.pinned && !root.compact: VerticalLayout {
+            alignment: center;
+            IconButton {
+                size: 22px;
+                icon: Icons.close;
+                clicked => {
+                    root.close();
+                }
+            }
+        }
+    }
+}
+
+component LinkRow inherits Rectangle {
+    in property <string> title;
+    in property <string> url;
+    in property <string> detail;
+    in property <bool> removable;
+    in property <bool> editable;
+    in property <bool> selected;
+    in property <string> icon: Icons.globe;
+    in property <image> favicon;
+    callback clicked;
+    callback middle-clicked;
+    callback remove;
+    callback edit;
+
+    height: 42px;
+    border-radius: 4px;
+    background: root.selected ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            root.clicked();
+        }
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+                root.middle-clicked();
+            }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 6px;
+        spacing: 10px;
+
+        VerticalLayout {
+            alignment: center;
+            if root.favicon.width > 0: Image {
+                source: root.favicon;
+                width: 16px;
+                height: 16px;
+                image-fit: contain;
+            }
+            if root.favicon.width == 0: Path {
+                width: 16px;
+                height: 16px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: root.icon;
+                stroke: Theme.dim;
+                stroke-width: 1.5px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.title;
+                overflow: elide;
+                color: Theme.text;
+            }
+            if root.url != "" && root.url != root.title: Text {
+                text: root.url;
+                overflow: elide;
+                font-size: 11px;
+                color: Theme.dim;
+            }
+        }
+
+        if root.detail != "": Text {
+            text: root.detail;
+            vertical-alignment: center;
+            font-size: 11px;
+            color: Theme.dim;
+        }
+
+        if root.editable: VerticalLayout {
+            alignment: center;
+            IconButton {
+                size: 26px;
+                icon: Icons.edit;
+                clicked => {
+                    root.edit();
+                }
+            }
+        }
+
+        if root.removable: VerticalLayout {
+            alignment: center;
+            IconButton {
+                size: 26px;
+                icon: Icons.close;
+                clicked => {
+                    root.remove();
+                }
+            }
+        }
+    }
+}
+
+component PageHeader inherits HorizontalLayout {
+    in property <string> title;
+    spacing: 8px;
+    height: 40px;
+    Text {
+        text: root.title;
+        font-size: 20px;
+        font-weight: 600;
+        vertical-alignment: center;
+        color: Theme.text;
+        horizontal-stretch: 1;
+    }
+    @children
+}
+
+component EmptyText inherits Text {
+    color: Theme.dim;
+    horizontal-alignment: center;
+    wrap: word-wrap;
+}
+
+export component AppWindow inherits Window {
+    // ---- state pushed from Rust ----
+    in property <[TabData]> tabs;
+    in property <int> active-tab;
+    in property <int> pinned-count;
+    in-out property <string> address;
+    in property <bool> can-go-back;
+    in property <bool> can-go-forward;
+    in property <bool> loading;
+    in property <bool> bookmarked;
+    in property <Page> page: Page.new-tab;
+    in property <bool> suggestions-open;
+    in property <[SuggestionData]> suggestions;
+    in-out property <int> selected-suggestion: -1;
+    in property <[LinkData]> bookmark-items;
+    in property <[LinkData]> history-items;
+    in property <[LinkData]> top-sites;
+    in property <[ExtensionData]> extensions;
+    in property <string> extensions-message;
+    in property <bool> extension-installing;
+    in property <string> status-text;
+    in property <string> memory-text;
+    in property <bool> memory-over;
+    // Error banner (e.g. WebView2 runtime missing). Empty = hidden.
+    in property <string> notice;
+    in property <SettingsData> settings;
+    in property <string> data-dir;
+    in property <string> app-version;
+    // Empty unless the MCP endpoint is running.
+    in property <string> mcp-url;
+    in property <string> window-title: "LiteBrowser";
+    in-out property <[ImportProfileData]> import-profiles;
+    // Index of the bookmark being edited on the bookmarks page, or -1.
+    in-out property <int> editing-bookmark: -1;
+    in property <string> import-message;
+
+    // ---- geometry of the web content area in logical pixels, read by Rust ----
+    // The page WebView fills `web-slot` (the whole content area, or what is left of it when DevTools
+    // is docked); the DevTools WebView fills whichever dock slot is active. Rust reads these to
+    // position both native views.
+    out property <length> web-view-x: web-slot.absolute-position.x;
+    out property <length> web-view-y: web-slot.absolute-position.y;
+    out property <length> web-view-width: web-slot.width;
+    out property <length> web-view-height: web-slot.height;
+    out property <length> devtools-x: root.devtools-right ? devtools-side.absolute-position.x : devtools-bottom.absolute-position.x;
+    out property <length> devtools-y: root.devtools-right ? devtools-side.absolute-position.y : devtools-bottom.absolute-position.y;
+    out property <length> devtools-width: root.devtools-right ? devtools-side.width : devtools-bottom.width;
+    out property <length> devtools-height: root.devtools-right ? devtools-side.height : devtools-bottom.height;
+    // True while a page is playing full screen, or the user pressed F11: every piece of
+    // browser chrome goes away and the page gets the whole window.
+    in property <bool> fullscreen;
+    in property <bool> devtools-open;
+    // false = docked at the bottom, true = docked on the right.
+    in property <bool> devtools-right;
+    in-out property <float> devtools-fraction: 0.4;
+
+    // ---- callbacks into Rust ----
+    callback content-geometry-changed();
+    callback command(string);
+    callback select-tab(int);
+    callback close-tab(int);
+    callback tab-context-menu(int);
+    callback navigate(string);
+    callback open-url(string);
+    callback open-url-new-tab(string);
+    callback go-back();
+    callback go-forward();
+    callback reload();
+    callback stop();
+    callback address-edited(string);
+    callback address-focus-changed(bool);
+    callback close-suggestions();
+    callback show-page(Page);
+    callback remove-bookmark(int);
+    callback save-bookmark(int, string, string);
+    callback history-search(string);
+    callback remove-history(string);
+    callback clear-history();
+    callback toggle-extension(string, bool);
+    callback remove-extension(string);
+    callback open-extensions-folder();
+    callback reload-extensions();
+    callback install-extension(string);
+    callback open-data-folder();
+    callback save-settings(SettingsData);
+    callback dismiss-notice();
+    callback refresh-import();
+    callback import-run(bool, bool);
+    callback import-passwords-csv();
+    callback toggle-devtools();
+    callback devtools-dock-menu();
+
+    public function focus-address() {
+        address-input.focus();
+        address-input.select-all();
+    }
+
+    title: root.window-title;
+    // Tabs sit at the very top like Chrome, so the system title bar is gone and the tab strip
+    // doubles as the caption (drag to move, double-click to maximize).
+    no-frame: true;
+    in property <bool> window-maximized;
+    callback minimize-window();
+    callback toggle-maximize-window();
+    callback close-window();
+    preferred-width: 1280px;
+    preferred-height: 820px;
+    min-width: 520px;
+    min-height: 360px;
+    background: Theme.surface;
+    default-font-size: 13px;
+    forward-focus: keys;
+
+    init => {
+        Palette.color-scheme = ColorScheme.light;
+    }
+
+    keys := FocusScope {
+        // Browser shortcuts while a Slint element has focus. (When the web page has focus, the
+        // same shortcuts come from WebView2's AcceleratorKeyPressed event instead.)
+        capture-key-pressed(e) => {
+            if (address-input.has-focus && root.suggestions-open) {
+                if (e.text == Key.DownArrow) {
+                    root.selected-suggestion = min(root.selected-suggestion + 1, root.suggestions.length - 1);
+                    return accept;
+                }
+                if (e.text == Key.UpArrow) {
+                    root.selected-suggestion = max(root.selected-suggestion - 1, -1);
+                    return accept;
+                }
+            }
+            if (e.text == Key.Escape && (root.suggestions-open || address-input.has-focus)) {
+                root.close-suggestions();
+                return accept;
+            }
+            // Clipboard shortcuts for the address bar. Slint's built-in text editing only matches
+            // lowercase letters, so with Caps Lock on (text comes through uppercase) copy/paste/cut
+            // would silently do nothing. Handle both cases here explicitly.
+            if (address-input.has-focus && e.modifiers.control && !e.modifiers.alt && !e.modifiers.shift) {
+                if (e.text == "c" || e.text == "C") {
+                    address-input.copy();
+                    return accept;
+                }
+                if (e.text == "x" || e.text == "X") {
+                    address-input.cut();
+                    return accept;
+                }
+                if (e.text == "v" || e.text == "V") {
+                    address-input.paste();
+                    return accept;
+                }
+                if (e.text == "a" || e.text == "A") {
+                    address-input.select-all();
+                    return accept;
+                }
+                if (e.text == "z" || e.text == "Z") {
+                    address-input.undo();
+                    return accept;
+                }
+            }
+            if (e.modifiers.control && e.modifiers.shift && (e.text == "i" || e.text == "I")) {
+                root.toggle-devtools();
+                return accept;
+            }
+            if (e.modifiers.control && !e.modifiers.alt) {
+                if (e.modifiers.shift) {
+                    if (e.text == "t" || e.text == "T") {
+                        root.command("reopen-tab");
+                        return accept;
+                    }
+                    if (e.text == "n" || e.text == "N") {
+                        root.command("new-private-tab");
+                        return accept;
+                    }
+                    if (e.text == "o" || e.text == "O") {
+                        root.command("bookmarks");
+                        return accept;
+                    }
+                    if (e.text == Key.Tab || e.text == Key.Backtab) {
+                        root.command("prev-tab");
+                        return accept;
+                    }
+                    return reject;
+                }
+                if (e.text == "t" || e.text == "T" || e.text == "n" || e.text == "N") {
+                    root.command("new-tab");
+                    return accept;
+                }
+                if (e.text == "w" || e.text == "W" || e.text == Key.F4) {
+                    root.command("close-tab");
+                    return accept;
+                }
+                if (e.text == "l" || e.text == "L") {
+                    root.focus-address();
+                    return accept;
+                }
+                if (e.text == "d" || e.text == "D") {
+                    root.command("bookmark");
+                    return accept;
+                }
+                if (e.text == "h" || e.text == "H") {
+                    root.command("history");
+                    return accept;
+                }
+                if (e.text == "j" || e.text == "J") {
+                    root.command("downloads");
+                    return accept;
+                }
+                if (e.text == "r" || e.text == "R") {
+                    root.command("reload");
+                    return accept;
+                }
+                if (e.text == Key.Tab || e.text == Key.PageDown) {
+                    root.command("next-tab");
+                    return accept;
+                }
+                if (e.text == Key.PageUp) {
+                    root.command("prev-tab");
+                    return accept;
+                }
+                if (e.text == "9") {
+                    root.command("last-tab");
+                    return accept;
+                }
+                if (e.text == "1" || e.text == "2" || e.text == "3" || e.text == "4" || e.text == "5" || e.text == "6" || e.text == "7" || e.text == "8") {
+                    root.command("tab-" + e.text);
+                    return accept;
+                }
+            }
+            if (e.modifiers.alt && !e.modifiers.control) {
+                if (e.text == "d" || e.text == "D") {
+                    root.focus-address();
+                    return accept;
+                }
+                if (e.text == Key.LeftArrow) {
+                    root.go-back();
+                    return accept;
+                }
+                if (e.text == Key.RightArrow) {
+                    root.go-forward();
+                    return accept;
+                }
+            }
+            if (e.text == Key.F6) {
+                root.focus-address();
+                return accept;
+            }
+            if (e.text == Key.F5) {
+                root.command("reload");
+                return accept;
+            }
+            if (e.text == Key.F12) {
+                root.toggle-devtools();
+                return accept;
+            }
+            if (e.text == Key.F11) {
+                root.command("fullscreen");
+                return accept;
+            }
+            if (e.text == Key.Escape && root.fullscreen) {
+                root.command("exit-fullscreen");
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            // ---------------- tab strip ----------------
+            tab-strip := Rectangle {
+                height: root.fullscreen ? 0px : 36px;
+                background: Theme.chrome;
+                clip: true;
+
+                // The empty part of the strip is the window caption: drag to move the window,
+                // double-click to maximize. Tabs and buttons sit above it and stay clickable.
+                WindowMoveArea {
+                    width: 100%;
+                    height: 100%;
+                    TouchArea {
+                        double-clicked => {
+                            root.toggle-maximize-window();
+                        }
+                    }
+                }
+
+                // Pinned tabs (always the first `pinned-count`) are compact; the rest share the space.
+                property <length> pin-w: 40px;
+                // 138px of caption buttons plus room for the "+" button.
+                property <length> normal-w: clamp(
+                    (self.width - 186px - root.pinned-count * self.pin-w) / max(1, root.tabs.length - root.pinned-count),
+                    64px, 220px);
+
+                function tab-x(i: int) -> length {
+                    if (i < root.pinned-count) {
+                        return 4px + i * self.pin-w;
+                    }
+                    return 4px + root.pinned-count * self.pin-w + (i - root.pinned-count) * self.normal-w;
+                }
+                function tab-w(i: int) -> length {
+                    return i < root.pinned-count ? self.pin-w : self.normal-w;
+                }
+
+                for t[i] in root.tabs: TabItem {
+                    x: tab-strip.tab-x(i);
+                    y: 4px;
+                    width: tab-strip.tab-w(i) - 2px;
+                    height: parent.height - 6px;
+                    tab: t;
+                    active: i == root.active-tab;
+                    compact: t.pinned;
+                    clicked => {
+                        root.select-tab(i);
+                    }
+                    close => {
+                        root.close-tab(i);
+                    }
+                    context-menu => {
+                        root.tab-context-menu(i);
+                    }
+                }
+
+                IconButton {
+                    x: min(tab-strip.tab-x(root.tabs.length) + 2px, parent.width - caption-buttons.width - self.width - 4px);
+                    y: (parent.height - self.height) / 2 + 1px;
+                    size: 28px;
+                    icon: Icons.plus;
+                    clicked => {
+                        root.command("new-tab");
+                    }
+                }
+
+                caption-buttons := HorizontalLayout {
+                    x: parent.width - self.width;
+                    width: 138px;
+                    height: parent.height;
+
+                    WindowButton {
+                        icon: Icons.caption-minimize;
+                        clicked => {
+                            root.minimize-window();
+                        }
+                    }
+
+                    WindowButton {
+                        icon: root.window-maximized ? Icons.caption-restore : Icons.caption-maximize;
+                        clicked => {
+                            root.toggle-maximize-window();
+                        }
+                    }
+
+                    WindowButton {
+                        icon: Icons.caption-close;
+                        danger: true;
+                        clicked => {
+                            root.close-window();
+                        }
+                    }
+                }
+            }
+
+            // ---------------- toolbar ----------------
+            // Collapsed rather than conditional: `address-input` lives in here and is reached by
+            // name from the key handler above, which an `if` would put out of scope.
+            Rectangle {
+                height: root.fullscreen ? 0px : 40px;
+                background: Theme.surface;
+                clip: true;
+
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 6px;
+                    padding-top: 5px;
+                    padding-bottom: 5px;
+                    spacing: 2px;
+
+                    IconButton {
+                        icon: Icons.back;
+                        enabled: root.can-go-back;
+                        clicked => {
+                            root.go-back();
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.forward;
+                        enabled: root.can-go-forward;
+                        clicked => {
+                            root.go-forward();
+                        }
+                    }
+
+                    IconButton {
+                        icon: root.loading ? Icons.close : Icons.reload;
+                        clicked => {
+                            if (root.loading) {
+                                root.stop();
+                            } else {
+                                root.reload();
+                            }
+                        }
+                    }
+
+                    address-input := LineEdit {
+                        horizontal-stretch: 1;
+                        placeholder-text: "輸入網址或搜尋";
+                        text <=> root.address;
+                        edited(text) => {
+                            root.selected-suggestion = -1;
+                            root.address-edited(text);
+                        }
+                        accepted(text) => {
+                            if (root.suggestions-open && root.selected-suggestion >= 0 && root.selected-suggestion < root.suggestions.length) {
+                                root.open-url(root.suggestions[root.selected-suggestion].url);
+                            } else {
+                                root.navigate(text);
+                            }
+                        }
+                        changed has-focus => {
+                            // No select-all here: clicking should place the caret like any text
+                            // field. Ctrl+L / Alt+D / F6 go through focus-address(), which selects.
+                            root.address-focus-changed(self.has-focus);
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.star;
+                        highlighted: root.bookmarked;
+                        enabled: root.page == Page.web;
+                        clicked => {
+                            root.command("bookmark");
+                        }
+                    }
+
+                    Rectangle {
+                        width: 6px;
+                    }
+
+                    IconButton {
+                        icon: Icons.bookmarks;
+                        highlighted: root.page == Page.bookmarks;
+                        clicked => {
+                            root.show-page(Page.bookmarks);
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.history;
+                        clicked => {
+                            root.show-page(Page.history);
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.download;
+                        clicked => {
+                            root.command("downloads");
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.puzzle;
+                        clicked => {
+                            root.show-page(Page.extensions);
+                        }
+                    }
+
+                    IconButton {
+                        icon: Icons.menu;
+                        clicked => {
+                            root.show-page(Page.settings);
+                        }
+                    }
+                }
+            }
+
+            // ---------------- bookmarks bar ----------------
+            if !root.fullscreen && root.settings.show-bookmarks-bar && root.bookmark-items.length > 0: Rectangle {
+                height: 28px;
+                background: Theme.surface;
+                clip: true;
+
+                HorizontalLayout {
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    padding-bottom: 3px;
+                    spacing: 2px;
+                    alignment: start;
+
+                    for b in root.bookmark-items: Rectangle {
+                        // A bookmark with no real name (title == url) shows just its site icon.
+                        property <bool> named: b.title != "" && b.title != b.url;
+                        border-radius: 4px;
+                        background: chip-touch.has-hover ? Theme.hover : transparent;
+                        max-width: 180px;
+
+                        chip-touch := TouchArea {
+                            clicked => {
+                                root.open-url(b.url);
+                            }
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+                                    root.open-url-new-tab(b.url);
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            padding-left: 6px;
+                            padding-right: 6px;
+                            spacing: 5px;
+
+                            VerticalLayout {
+                                alignment: center;
+                                if b.favicon.width > 0: Image {
+                                    source: b.favicon;
+                                    width: 14px;
+                                    height: 14px;
+                                    image-fit: contain;
+                                }
+                                if b.favicon.width == 0: Path {
+                                    width: 13px;
+                                    height: 13px;
+                                    viewbox-width: 24;
+                                    viewbox-height: 24;
+                                    commands: Icons.globe;
+                                    stroke: Theme.dim;
+                                    stroke-width: 1.6px;
+                                    stroke-line-cap: round;
+                                }
+                            }
+
+                            if parent.named: Text {
+                                text: b.title;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                font-size: 12px;
+                                color: Theme.text;
+                            }
+                        }
+                    }
+                }
+            }
+
+            Rectangle {
+                height: 1px;
+                background: Theme.border;
+            }
+
+            // ---------------- notice banner ----------------
+            if !root.fullscreen && root.notice != "": Rectangle {
+                background: #fff4ce;
+
+                HorizontalLayout {
+                    padding: 8px;
+                    spacing: 8px;
+                    Text {
+                        text: root.notice;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        color: #3d2e00;
+                    }
+
+                    IconButton {
+                        icon: Icons.close;
+                        size: 26px;
+                        clicked => {
+                            root.dismiss-notice();
+                        }
+                    }
+                }
+            }
+
+            // ---------------- content ----------------
+            content := Rectangle {
+                vertical-stretch: 1;
+                background: Theme.surface;
+                property <bool> dock: root.devtools-open && root.page == Page.web;
+                property <bool> dock-bottom: content.dock && !root.devtools-right;
+                property <bool> dock-side: content.dock && root.devtools-right;
+                property <float> frac: clamp(root.devtools-fraction, 0.15, 0.8);
+
+                // WebView host slots. The page WebView always covers `web-slot`; DevTools covers
+                // `devtools-bottom` or `devtools-side` depending on where it is docked. The splits are
+                // driven by stretch factors (not by referencing content.width/height, which would
+                // create a layout binding loop). The inactive slot gets stretch 0, so it collapses.
+                HorizontalLayout {
+                    VerticalLayout {
+                        horizontal-stretch: content.dock-side ? 1 - content.frac : 1;
+
+                        web-slot := Rectangle {
+                            vertical-stretch: content.dock-bottom ? 1 - content.frac : 1;
+                            changed width => {
+                                root.content-geometry-changed();
+                            }
+                            changed height => {
+                                root.content-geometry-changed();
+                            }
+                            changed absolute-position => {
+                                root.content-geometry-changed();
+                            }
+                        }
+
+                        // Splitter above a bottom-docked DevTools (a thin Slint strip, never covered
+                        // by a WebView, so it stays clickable).
+                        Rectangle {
+                            height: content.dock-bottom ? 6px : 0px;
+                            vertical-stretch: 0;
+                            background: bottom-splitter.has-hover ? Theme.accent : Theme.border;
+                            bottom-splitter := TouchArea {
+                                mouse-cursor: row-resize;
+                                property <float> start-fraction;
+                                pointer-event(e) => {
+                                    if (e.kind == PointerEventKind.down) {
+                                        self.start-fraction = root.devtools-fraction;
+                                    } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                                        root.devtools-dock-menu();
+                                    }
+                                }
+                                moved => {
+                                    if (content.dock-bottom && self.pressed) {
+                                        root.devtools-fraction = clamp(
+                                            self.start-fraction - (self.mouse-y - self.pressed-y) / max(1px, content.height),
+                                            0.15, 0.8);
+                                    }
+                                }
+                            }
+                        }
+
+                        devtools-bottom := Rectangle {
+                            vertical-stretch: content.dock-bottom ? content.frac : 0;
+                            changed height => {
+                                root.content-geometry-changed();
+                            }
+                            changed absolute-position => {
+                                root.content-geometry-changed();
+                            }
+                        }
+                    }
+
+                    // Splitter left of a right-docked DevTools.
+                    Rectangle {
+                        width: content.dock-side ? 6px : 0px;
+                        horizontal-stretch: 0;
+                        background: side-splitter.has-hover ? Theme.accent : Theme.border;
+                        side-splitter := TouchArea {
+                            mouse-cursor: col-resize;
+                            property <float> start-fraction;
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down) {
+                                    self.start-fraction = root.devtools-fraction;
+                                } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                                    root.devtools-dock-menu();
+                                }
+                            }
+                            moved => {
+                                if (content.dock-side && self.pressed) {
+                                    root.devtools-fraction = clamp(
+                                        self.start-fraction - (self.mouse-x - self.pressed-x) / max(1px, content.width),
+                                        0.15, 0.8);
+                                }
+                            }
+                        }
+                    }
+
+                    devtools-side := Rectangle {
+                        horizontal-stretch: content.dock-side ? content.frac : 0;
+                        changed width => {
+                            root.content-geometry-changed();
+                        }
+                        changed absolute-position => {
+                            root.content-geometry-changed();
+                        }
+                    }
+                }
+
+                if !root.suggestions-open && root.page == Page.web && !root.devtools-open: EmptyText {
+                    width: parent.width;
+                    height: parent.height;
+                    text: root.loading ? "載入中…" : "";
+                    vertical-alignment: center;
+                }
+
+                // Address bar suggestions (the WebView is hidden while these are open).
+                if root.suggestions-open: VerticalLayout {
+                    padding: 8px;
+                    alignment: start;
+                    for s[i] in root.suggestions: LinkRow {
+                        title: s.title;
+                        url: s.kind == "search" || s.kind == "url" ? "" : s.url;
+                        detail: s.kind == "bookmark" ? "書籤" : s.kind == "history" ? "歷史紀錄" : "";
+                        icon: s.kind == "search" ? Icons.search : s.kind == "bookmark" ? Icons.bookmarks : s.kind == "history" ? Icons.history : Icons.globe;
+                        selected: i == root.selected-suggestion;
+                        clicked => {
+                            root.open-url(s.url);
+                        }
+                        middle-clicked => {
+                            root.open-url-new-tab(s.url);
+                        }
+                    }
+                }
+
+                // New tab page.
+                if !root.suggestions-open && root.page == Page.new-tab: HorizontalLayout {
+                    padding: 32px;
+                    spacing: 32px;
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "書籤";
+                            font-size: 16px;
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+
+                        if root.bookmark-items.length == 0: Text {
+                            text: "還沒有書籤。開啟網頁後按 ☆ 或 Ctrl+D 加入。";
+                            color: Theme.dim;
+                            wrap: word-wrap;
+                        }
+                        for b in root.bookmark-items: LinkRow {
+                            title: b.title;
+                            url: b.url;
+                            favicon: b.favicon;
+                            icon: Icons.bookmarks;
+                            clicked => {
+                                root.open-url(b.url);
+                            }
+                            middle-clicked => {
+                                root.open-url-new-tab(b.url);
+                            }
+                        }
+                    }
+
+                    VerticalLayout {
+                        spacing: 4px;
+                        alignment: start;
+                        horizontal-stretch: 1;
+                        Text {
+                            text: "常去的網站";
+                            font-size: 16px;
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+
+                        if root.top-sites.length == 0: Text {
+                            text: "瀏覽過的網站會出現在這裡。";
+                            color: Theme.dim;
+                        }
+                        for h in root.top-sites: LinkRow {
+                            title: h.title;
+                            url: h.url;
+                            favicon: h.favicon;
+                            clicked => {
+                                root.open-url(h.url);
+                            }
+                            middle-clicked => {
+                                root.open-url-new-tab(h.url);
+                            }
+                        }
+
+                        Rectangle {
+                            height: 16px;
+                        }
+
+                        Text {
+                            text: "小提示：分頁上按滑鼠右鍵可釘選、複製、關閉其他等（釘選的分頁不會被釋放），中鍵＝關閉。\n灰色空心圓點的分頁已釋放記憶體，點一下會重新載入。";
+                            color: Theme.dim;
+                            font-size: 12px;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+
+                // Bookmarks page.
+                if !root.suggestions-open && root.page == Page.bookmarks: VerticalLayout {
+                    padding: 24px;
+                    spacing: 8px;
+                    PageHeader {
+                        title: "書籤";
+                    }
+
+                    if root.bookmark-items.length == 0: EmptyText {
+                        text: "沒有書籤";
+                    }
+                    ListView {
+                        vertical-stretch: 1;
+                        for b[i] in root.bookmark-items: Rectangle {
+                            height: 42px;
+
+                            if i != root.editing-bookmark: LinkRow {
+                                width: parent.width;
+                                height: parent.height;
+                                title: b.title;
+                                url: b.url;
+                                favicon: b.favicon;
+                                icon: Icons.bookmarks;
+                                editable: true;
+                                removable: true;
+                                clicked => {
+                                    root.open-url(b.url);
+                                }
+                                middle-clicked => {
+                                    root.open-url-new-tab(b.url);
+                                }
+                                edit => {
+                                    root.editing-bookmark = i;
+                                }
+                                remove => {
+                                    root.remove-bookmark(i);
+                                }
+                            }
+
+                            if i == root.editing-bookmark: HorizontalLayout {
+                                width: parent.width;
+                                height: parent.height;
+                                spacing: 6px;
+                                padding-right: 4px;
+
+                                title-edit := LineEdit {
+                                    horizontal-stretch: 1;
+                                    placeholder-text: "名稱";
+                                    text: b.title == b.url ? "" : b.title;
+                                    accepted => {
+                                        root.save-bookmark(i, self.text, url-edit.text);
+                                        root.editing-bookmark = -1;
+                                    }
+                                }
+
+                                url-edit := LineEdit {
+                                    horizontal-stretch: 2;
+                                    placeholder-text: "網址";
+                                    text: b.url;
+                                    accepted => {
+                                        root.save-bookmark(i, title-edit.text, self.text);
+                                        root.editing-bookmark = -1;
+                                    }
+                                }
+
+                                Button {
+                                    text: "儲存";
+                                    primary: true;
+                                    clicked => {
+                                        root.save-bookmark(i, title-edit.text, url-edit.text);
+                                        root.editing-bookmark = -1;
+                                    }
+                                }
+
+                                Button {
+                                    text: "取消";
+                                    clicked => {
+                                        root.editing-bookmark = -1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // History page.
+                if !root.suggestions-open && root.page == Page.history: VerticalLayout {
+                    padding: 24px;
+                    spacing: 8px;
+                    PageHeader {
+                        title: "歷史紀錄";
+                        LineEdit {
+                            width: 260px;
+                            placeholder-text: "搜尋歷史紀錄";
+                            edited(text) => {
+                                root.history-search(text);
+                            }
+                        }
+
+                        Button {
+                            text: "清除全部";
+                            clicked => {
+                                root.clear-history();
+                            }
+                        }
+                    }
+
+                    if root.history-items.length == 0: EmptyText {
+                        text: "沒有歷史紀錄";
+                    }
+                    ListView {
+                        vertical-stretch: 1;
+                        for h in root.history-items: LinkRow {
+                            title: h.title;
+                            url: h.url;
+                            detail: h.detail;
+                            favicon: h.favicon;
+                            icon: Icons.history;
+                            removable: true;
+                            clicked => {
+                                root.open-url(h.url);
+                            }
+                            middle-clicked => {
+                                root.open-url-new-tab(h.url);
+                            }
+                            remove => {
+                                root.remove-history(h.url);
+                            }
+                        }
+                    }
+                }
+
+                // Extensions page.
+                if !root.suggestions-open && root.page == Page.extensions: VerticalLayout {
+                    padding: 24px;
+                    spacing: 8px;
+                    PageHeader {
+                        title: "擴充功能";
+                        Button {
+                            text: "開啟擴充功能資料夾";
+                            clicked => {
+                                root.open-extensions-folder();
+                            }
+                        }
+
+                        Button {
+                            text: "重新載入";
+                            clicked => {
+                                root.reload-extensions();
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "貼上 Chrome 線上應用程式商店的網址（或擴充功能 ID），按「安裝」即可下載安裝。";
+                        wrap: word-wrap;
+                        color: Theme.dim;
+                    }
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        store-url := LineEdit {
+                            placeholder-text: "https://chromewebstore.google.com/detail/.../abcdefgh...";
+                            horizontal-stretch: 1;
+                            enabled: !root.extension-installing;
+                            accepted => {
+                                root.install-extension(self.text);
+                            }
+                        }
+
+                        Button {
+                            text: root.extension-installing ? "安裝中…" : "安裝";
+                            enabled: !root.extension-installing && store-url.text != "";
+                            primary: true;
+                            clicked => {
+                                root.install-extension(store-url.text);
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "或者，把「解壓縮後」的擴充功能資料夾（含 manifest.json）放進擴充功能資料夾，再按「重新載入」。\n例如 uBlock Origin Lite：到 GitHub 下載 uBOLite_x.x.x.chromium.zip，解壓縮成一個資料夾放進去。\n注意：WebView2 不會顯示擴充功能的工具列按鈕，所以需要點按鈕操作的擴充功能（例如密碼管理器）無法使用。";
+                        wrap: word-wrap;
+                        color: Theme.dim;
+                    }
+
+                    if root.extensions-message != "": Text {
+                        text: root.extensions-message;
+                        wrap: word-wrap;
+                        color: Theme.text;
+                    }
+
+                    ListView {
+                        vertical-stretch: 1;
+                        for ext in root.extensions: Rectangle {
+                            height: 40px;
+                            HorizontalLayout {
+                                padding-left: 10px;
+                                spacing: 10px;
+                                Text {
+                                    text: ext.name;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                    horizontal-stretch: 1;
+                                    color: Theme.text;
+                                }
+
+                                CheckBox {
+                                    text: "啟用";
+                                    checked: ext.enabled;
+                                    toggled => {
+                                        root.toggle-extension(ext.id, self.checked);
+                                    }
+                                }
+
+                                Button {
+                                    text: "移除";
+                                    clicked => {
+                                        root.remove-extension(ext.id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Settings page.
+                // Import page.
+                if !root.suggestions-open && root.page == Page.import: ScrollView {
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 10px;
+                        alignment: start;
+
+                        PageHeader {
+                            title: "從其他瀏覽器匯入";
+                            Button {
+                                text: "重新偵測";
+                                clicked => {
+                                    root.refresh-import();
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "書籤與歷史紀錄是直接讀取瀏覽器的檔案，不需要你先匯出任何東西。\n請先關閉要匯入的瀏覽器（檔案被鎖住就讀不到），再勾選設定檔：";
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+
+                        if root.import-profiles.length == 0: EmptyText {
+                            text: "找不到已安裝的 Chrome、Edge、Brave 或 Firefox 設定檔。";
+                        }
+
+                        for p[i] in root.import-profiles: CheckBox {
+                            text: p.label;
+                            checked: p.selected;
+                            toggled => {
+                                root.import-profiles[i].selected = self.checked;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 16px;
+                            padding-top: 4px;
+                            import-bookmarks := CheckBox {
+                                text: "書籤";
+                                checked: true;
+                            }
+
+                            import-history := CheckBox {
+                                text: "歷史紀錄";
+                                checked: true;
+                            }
+                        }
+
+                        Button {
+                            text: "匯入勾選的設定檔";
+                            primary: true;
+                            clicked => {
+                                root.import-run(import-bookmarks.checked, import-history.checked);
+                            }
+                        }
+
+                        Rectangle {
+                            height: 1px;
+                            background: Theme.border;
+                        }
+
+                        Text {
+                            text: "密碼";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+
+                        Text {
+                            text: "只有「密碼」需要你先匯出 CSV，書籤和歷史不用。\n密碼在各瀏覽器裡是加密的，而且 Chrome 新版的 app-bound 加密本來就讀不出來；直接去解別人的密碼庫，寫出來的程式和竊密軟體沒兩樣，所以改走官方匯出。\n做法：在原瀏覽器的密碼設定選「匯出密碼」（會要求你驗證身分）存成 CSV，再按下面的按鈕選擇，然後重新啟動一次 LiteBrowser。";
+                            wrap: word-wrap;
+                            color: Theme.dim;
+                        }
+
+                        Button {
+                            text: "選擇密碼 CSV 檔…";
+                            clicked => {
+                                root.import-passwords-csv();
+                            }
+                        }
+
+                        if root.import-message != "": Text {
+                            text: root.import-message;
+                            wrap: word-wrap;
+                            color: Theme.text;
+                        }
+                    }
+                }
+
+                if !root.suggestions-open && root.page == Page.settings: ScrollView {
+                    VerticalLayout {
+                        padding: 24px;
+                        spacing: 10px;
+                        alignment: start;
+
+                        PageHeader {
+                            title: "設定";
+                            Button {
+                                text: "從其他瀏覽器匯入…";
+                                clicked => {
+                                    root.show-page(Page.import);
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "記憶體";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "同時保留網頁的分頁數（含目前分頁）";
+                                vertical-alignment: center;
+                                width: 300px;
+                                color: Theme.text;
+                            }
+
+                            live := SpinBox {
+                                width: 120px;
+                                minimum: 1;
+                                maximum: 20;
+                                value: root.settings.max-live-tabs;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "背景分頁凍結時間（秒）";
+                                vertical-alignment: center;
+                                width: 300px;
+                                color: Theme.text;
+                            }
+
+                            suspend := SpinBox {
+                                width: 120px;
+                                minimum: 5;
+                                maximum: 3600;
+                                step-size: 5;
+                                value: root.settings.suspend-after-secs;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "背景分頁釋放時間（分鐘）";
+                                vertical-alignment: center;
+                                width: 300px;
+                                color: Theme.text;
+                            }
+
+                            discard := SpinBox {
+                                width: 120px;
+                                minimum: 1;
+                                maximum: 1440;
+                                value: root.settings.discard-after-mins;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "記憶體上限（MB），超過就釋放最久沒用的分頁";
+                                vertical-alignment: center;
+                                width: 300px;
+                                wrap: word-wrap;
+                                color: Theme.text;
+                            }
+
+                            budget := SpinBox {
+                                width: 120px;
+                                minimum: 100;
+                                maximum: 16000;
+                                step-size: 50;
+                                value: root.settings.memory-budget-mb;
+                            }
+                        }
+
+                        Text {
+                            text: "瀏覽";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+
+                        adblock := CheckBox {
+                            text: "封鎖廣告與追蹤網域（清單：資料夾裡的 blocklist.txt）";
+                            checked: root.settings.adblock;
+                        }
+
+                        restore := CheckBox {
+                            text: "啟動時恢復上次的分頁";
+                            checked: root.settings.restore-session;
+                        }
+
+                        bar := CheckBox {
+                            text: "顯示書籤列";
+                            checked: root.settings.show-bookmarks-bar;
+                        }
+
+                        gpu := CheckBox {
+                            text: "停用 GPU（VDI 沒有顯示卡時建議開啟，重新啟動後生效）";
+                            checked: root.settings.disable-gpu;
+                        }
+
+                        devtools-dock := CheckBox {
+                            text: "開發人員工具停駐在右側（預設在下方；也可在分隔線上按右鍵切換）";
+                            checked: root.settings.devtools-dock-right;
+                        }
+
+                        Text {
+                            text: "讓 LLM 操作";
+                            font-size: 15px;
+                            font-weight: 600;
+                            color: Theme.text;
+                        }
+
+                        mcp := CheckBox {
+                            text: "開啟 MCP 服務，讓 Claude 等 LLM 操作這個瀏覽器（只接受本機連線，重新啟動後生效）";
+                            checked: root.settings.mcp-enabled;
+                        }
+
+                        if root.mcp-url != "": Text {
+                            text: "MCP 網址（每次啟動都會換，也會寫進資料夾的 mcp-url.txt）：\n" + root.mcp-url;
+                            wrap: word-wrap;
+                            color: Theme.dim;
+                            font-size: 11px;
+                        }
+
+                        if root.settings.mcp-enabled && root.mcp-url == "": Text {
+                            text: "MCP 服務會在下次啟動時開啟。";
+                            color: Theme.dim;
+                            font-size: 11px;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 12px;
+                            Text {
+                                text: "搜尋網址（{} 會換成搜尋文字）";
+                                vertical-alignment: center;
+                                width: 300px;
+                                color: Theme.text;
+                            }
+
+                            search := LineEdit {
+                                horizontal-stretch: 1;
+                                text: root.settings.search-url;
+                            }
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            alignment: start;
+                            Button {
+                                text: "儲存";
+                                primary: true;
+                                clicked => {
+                                    root.save-settings({
+                                        max-live-tabs: live.value,
+                                        suspend-after-secs: suspend.value,
+                                        discard-after-mins: discard.value,
+                                        memory-budget-mb: budget.value,
+                                        adblock: adblock.checked,
+                                        disable-gpu: gpu.checked,
+                                        restore-session: restore.checked,
+                                        show-bookmarks-bar: bar.checked,
+                                        search-url: search.text,
+                                        devtools-dock-right: devtools-dock.checked,
+                                        mcp-enabled: mcp.checked,
+                                    });
+                                }
+                            }
+
+                            Button {
+                                text: "開啟資料夾";
+                                clicked => {
+                                    root.open-data-folder();
+                                }
+                            }
+                        }
+
+                        Text {
+                            text: "資料夾：" + root.data-dir + "\n書籤、歷史紀錄、Cookie 與儲存的密碼都在這裡。";
+                            color: Theme.dim;
+                            wrap: word-wrap;
+                        }
+
+                        Text {
+                            text: "LiteBrowser " + root.app-version + "　GPL-3.0";
+                            color: Theme.dim;
+                            font-size: 11px;
+                        }
+                    }
+                }
+            }
+
+            // ---------------- status bar ----------------
+            if !root.fullscreen: Rectangle {
+                height: 24px;
+                background: Theme.chrome;
+
+                HorizontalLayout {
+                    padding-left: 10px;
+                    padding-right: 10px;
+                    spacing: 12px;
+                    Text {
+                        text: root.status-text;
+                        vertical-alignment: center;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        font-size: 11px;
+                        color: Theme.dim;
+                    }
+
+                    Text {
+                        text: root.memory-text;
+                        vertical-alignment: center;
+                        font-size: 11px;
+                        color: root.memory-over ? Theme.danger : Theme.dim;
+                    }
+                }
+            }
+        }
+    }
+}
