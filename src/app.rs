@@ -226,6 +226,7 @@ fn start_update_check() {
                 log!("update available: {}", release.version);
                 match update::download(&release, &root) {
                     Ok(()) => {
+                        log!("update {} downloaded", release.version);
                         let version = release.version.clone();
                         let _ = slint::invoke_from_event_loop(move || {
                             APP.with(|cell| {

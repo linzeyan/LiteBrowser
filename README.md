@@ -163,7 +163,7 @@ LiteBrowser 會向商店要 `.crx`，解開成一個資料夾放在 `extensions\
 | `discard_after_mins` | 15 | 背景分頁幾分鐘後釋放 |
 | `memory_budget_mb` | 500 | 記憶體上限 |
 | `adblock` | true | 封鎖廣告／追蹤網域（重新啟動後生效） |
-| `disable_gpu` | false | 在沒有顯示卡的機器上停用 GPU 可省約 240 MB（實測 GPU 程序 258 MB → 18 MB），但 WebGL 會改由 SwiftShader 提供，部分網站的機器人驗證可能因此起疑，所以預設不停用（重新啟動後生效） |
+| `disable_gpu` | false | 停用 GPU 不會比較省記憶體（實測 10 個網站：開分頁時的尖峰反而更高，因為改由 SwiftShader 在 GPU 程序裡軟體算圖），而且部分網站的機器人驗證需要 WebGL，所以預設不停用（重新啟動後生效） |
 | `restore_session` | true | 啟動時恢復上次的分頁 |
 | `show_bookmarks_bar` | true | 顯示書籤列 |
 | `search_url` | Google | 搜尋網址，`{}` 會換成搜尋文字 |
