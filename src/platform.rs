@@ -5,7 +5,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, WPARAM};
+use windows::Win32::Graphics::Gdi::ClientToScreen;
 use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -14,7 +15,7 @@ use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, SendMessageW, SetForegroundWindow,
     TrackPopupMenuEx, HMENU, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WM_COPYDATA,
+    TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WM_COPYDATA,
 };
 
 /// A hidden window class/title used to find a running instance. Also the WM_COPYDATA tag.
@@ -146,6 +147,21 @@ pub fn set_menu_owner(hwnd: HWND) {
 
 /// Shows a blocking popup menu at the cursor and returns the chosen item id (0 = cancelled).
 pub fn popup_menu(items: &[MenuItem]) -> u32 {
+    let mut pt = POINT::default();
+    let _ = unsafe { GetCursorPos(&mut pt) };
+    track_menu(items, pt, TPM_RETURNCMD | TPM_RIGHTBUTTON)
+}
+
+/// Like `popup_menu`, but with the menu's top-right corner at (x, y) of the owner's client area,
+/// in physical pixels: how Chrome drops its main menu below the ⋮ button.
+pub fn popup_menu_below(items: &[MenuItem], x: i32, y: i32) -> u32 {
+    let Some(owner) = OWNER.with(|o| *o.borrow()) else { return 0 };
+    let mut pt = POINT { x, y };
+    let _ = unsafe { ClientToScreen(owner, &mut pt) };
+    track_menu(items, pt, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN | TPM_TOPALIGN)
+}
+
+fn track_menu(items: &[MenuItem], pt: POINT, flags: TRACK_POPUP_MENU_FLAGS) -> u32 {
     let owner = OWNER.with(|o| *o.borrow());
     let Some(owner) = owner else { return 0 };
     unsafe {
@@ -153,17 +169,8 @@ pub fn popup_menu(items: &[MenuItem]) -> u32 {
         for item in items {
             append(menu, item);
         }
-        let mut pt = windows::Win32::Foundation::POINT::default();
-        let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(owner);
-        let chosen = TrackPopupMenuEx(
-            menu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
-            pt.x,
-            pt.y,
-            owner,
-            None,
-        );
+        let chosen = TrackPopupMenuEx(menu, flags.0, pt.x, pt.y, owner, None);
         let _ = DestroyMenu(menu);
         chosen.0 as u32
     }

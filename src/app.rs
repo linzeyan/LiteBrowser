@@ -85,6 +85,9 @@ pub enum UiEvent {
     DismissNotice,
     GeometryChanged,
     TabContextMenu(usize),
+    /// The ⋮ button was clicked; its bottom-right corner in logical window coordinates.
+    MainMenu(f32, f32),
+    AddressMenu,
     ToggleDevtools,
     DevtoolsDockMenu,
     MinimizeWindow,
@@ -319,6 +322,8 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_select_tab(|i| ui_post(UiEvent::SelectTab(i.max(0) as usize)));
     ui.on_close_tab(|i| ui_post(UiEvent::CloseTab(i.max(0) as usize)));
     ui.on_tab_context_menu(|i| ui_post(UiEvent::TabContextMenu(i.max(0) as usize)));
+    ui.on_main_menu(|x, y| ui_post(UiEvent::MainMenu(x, y)));
+    ui.on_address_menu(|| ui_post(UiEvent::AddressMenu));
     ui.on_navigate(|text| ui_post(UiEvent::Navigate(text.into())));
     ui.on_open_url(|url| ui_post(UiEvent::OpenUrl(url.into())));
     ui.on_open_url_new_tab(|url| ui_post(UiEvent::OpenUrlNewTab(url.into())));
@@ -767,6 +772,8 @@ impl App {
             UiEvent::SelectTab(i) => self.activate(i),
             UiEvent::CloseTab(i) => self.close_tab(i),
             UiEvent::TabContextMenu(i) => self.tab_context_menu(i),
+            UiEvent::MainMenu(x, y) => self.main_menu(x, y),
+            UiEvent::AddressMenu => self.address_menu(),
             UiEvent::Navigate(text) => {
                 if let Some(url) = url_input::to_url(&text, &self.cfg.search_url) {
                     self.navigate_active(url);
@@ -847,11 +854,7 @@ impl App {
                 self.ui.window().set_maximized(maximized);
                 self.ui.set_window_maximized(maximized);
             }
-            // Same as the old system close button: the session is kept for next time.
-            UiEvent::CloseWindow => {
-                self.save_all();
-                slint::quit_event_loop().ok();
-            }
+            UiEvent::CloseWindow => self.quit(),
             UiEvent::RefreshImport => self.refresh_import(),
             UiEvent::ImportRun { bookmarks, history } => self.run_import(bookmarks, history),
             UiEvent::ImportPasswordsCsv => self.import_passwords_csv(),
@@ -1535,6 +1538,16 @@ impl App {
         }
         self.address_edited = false;
         let url = self.tabs.get(self.active).map(|t| t.url.clone()).unwrap_or_default();
+        let kind = if url.starts_with("https://") {
+            "secure"
+        } else if url.starts_with("http://") {
+            "insecure"
+        } else {
+            ""
+        };
+        self.ui.set_site_kind(kind.into());
+        self.ui.set_display_address(url_input::display(&url).into());
+        self.ui.set_page_url(url.clone().into());
         self.ui.set_address(url.into());
     }
 
@@ -1932,8 +1945,12 @@ impl App {
     }
 
     fn refresh_top_sites(&mut self) {
-        let top: Vec<(String, String)> =
+        let mut top: Vec<(String, String)> =
             self.history.top_sites(8).into_iter().map(|h| (h.url.clone(), h.title.clone())).collect();
+        // Until there is any history, the new tab page's tiles show the first bookmarks instead.
+        if top.is_empty() {
+            top = self.bookmarks.items().iter().take(8).map(|b| (b.url.clone(), b.title.clone())).collect();
+        }
         let items: Vec<LinkData> = top
             .into_iter()
             .map(|(url, title)| LinkData {
@@ -2388,6 +2405,83 @@ impl App {
                 self.with_active_view(WebView::open_devtools_window);
             }
         }
+    }
+
+    /// Chrome's ⋮ menu, hung from the button's bottom-right corner.
+    fn main_menu(&mut self, x: f32, y: f32) {
+        let bar = self.cfg.show_bookmarks_bar;
+        let menu = vec![
+            MenuItem::entry(1, "新分頁\tCtrl+T"),
+            MenuItem::entry(2, "新無痕分頁\tCtrl+Shift+N"),
+            MenuItem::Separator,
+            MenuItem::entry(3, "歷史紀錄\tCtrl+H"),
+            MenuItem::entry(4, "下載\tCtrl+J"),
+            MenuItem::entry(5, "書籤\tCtrl+Shift+O"),
+            MenuItem::Entry { id: 6, label: "顯示書籤列".into(), checked: bar, enabled: true },
+            if self.closed.is_empty() {
+                MenuItem::disabled("重新開啟關閉的分頁\tCtrl+Shift+T")
+            } else {
+                MenuItem::entry(7, "重新開啟關閉的分頁\tCtrl+Shift+T")
+            },
+            MenuItem::Separator,
+            MenuItem::entry(8, "全螢幕\tF11"),
+            MenuItem::entry(9, "開發人員工具\tF12"),
+            MenuItem::Separator,
+            MenuItem::entry(10, "擴充功能"),
+            MenuItem::entry(11, "從其他瀏覽器匯入…"),
+            MenuItem::entry(12, "設定"),
+            MenuItem::Separator,
+            MenuItem::entry(13, "結束"),
+        ];
+        let scale = self.ui.window().scale_factor();
+        match platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32) {
+            1 => self.run_shortcut(Shortcut::NewTab),
+            2 => self.run_shortcut(Shortcut::NewPrivateTab),
+            3 => self.run_shortcut(Shortcut::ShowHistory),
+            4 => self.run_shortcut(Shortcut::ShowDownloads),
+            5 => self.run_shortcut(Shortcut::ShowBookmarks),
+            6 => {
+                let mut s = self.settings_data();
+                s.show_bookmarks_bar = !bar;
+                self.save_settings(s);
+            }
+            7 => self.run_shortcut(Shortcut::ReopenClosedTab),
+            8 => self.run_shortcut(Shortcut::ToggleFullScreen),
+            9 => self.run_shortcut(Shortcut::ToggleDevtools),
+            10 => self.show_page(Page::Extensions),
+            11 => self.show_page(Page::Import),
+            12 => self.show_page(Page::Settings),
+            13 => self.quit(),
+            _ => {}
+        }
+    }
+
+    /// The omnibox's edit menu, native so it is not hidden under the WebView like a Slint popup.
+    fn address_menu(&mut self) {
+        let menu = vec![
+            MenuItem::entry(1, "復原"),
+            MenuItem::Separator,
+            MenuItem::entry(2, "剪下"),
+            MenuItem::entry(3, "複製"),
+            MenuItem::entry(4, "貼上"),
+            MenuItem::Separator,
+            MenuItem::entry(5, "全選"),
+        ];
+        let action = match platform::popup_menu(&menu) {
+            1 => "undo",
+            2 => "cut",
+            3 => "copy",
+            4 => "paste",
+            5 => "select-all",
+            _ => return,
+        };
+        self.ui.invoke_address_action(action.into());
+    }
+
+    /// Same as the old system close button: the session is kept for next time.
+    fn quit(&mut self) {
+        self.save_all();
+        slint::quit_event_loop().ok();
     }
 
     /// Right-clicking the DevTools splitter offers the dock side (and closing it).

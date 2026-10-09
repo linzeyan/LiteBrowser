@@ -90,6 +90,16 @@ pub fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
+/// How the omnibox shows a URL while it is not being edited: no http(s) scheme (the site icon
+/// already tells them apart) and no lone trailing slash, as Chrome and Firefox show it.
+pub fn display(url: &str) -> String {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url);
+    match rest.strip_suffix('/') {
+        Some(host) if !host.contains('/') => host.to_string(),
+        _ => rest.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,6 +144,16 @@ mod tests {
     #[test]
     fn empty_input() {
         assert_eq!(to_url("   ", S), None);
+    }
+
+    #[test]
+    fn display_hides_only_the_scheme_and_a_lone_slash() {
+        // Whatever identifies the page stays visible; only what the site icon already says goes.
+        assert_eq!(display("https://github.com/"), "github.com");
+        assert_eq!(display("http://example.com/a/"), "example.com/a/");
+        assert_eq!(display("https://www.google.com/search?q=x"), "www.google.com/search?q=x");
+        assert_eq!(display("file:///C:/a.html"), "file:///C:/a.html");
+        assert_eq!(display(""), "");
     }
 
     #[test]
