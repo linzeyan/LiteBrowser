@@ -2391,8 +2391,12 @@ export component AppWindow inherits Window {
                             single-line: true;
                             font-size: 15px;
                             color: self.trimmed ? transparent : Theme.text;
-                            selection-background-color: #a8c7fa;
-                            selection-foreground-color: Theme.text;
+                            // Slint keeps the selection when focus moves to the page, and selected
+                            // text is painted in these colours, so a Ctrl+L selection would sit
+                            // over the trimmed address as a highlighted full URL. Chrome shows no
+                            // selection in an unfocused omnibox.
+                            selection-background-color: self.has-focus ? #a8c7fa : transparent;
+                            selection-foreground-color: self.color;
                             text <=> root.address;
                             cursor-position-changed(pos) => {
                                 if (pos.x + self.computed-x < 0px) {

@@ -1,6 +1,6 @@
 //! Win32 glue between the Slint window and the WebView2 child windows.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
@@ -9,14 +9,17 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetWindowLongPtrW, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE, ICON_BIG, ICON_SMALL,
-    IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL,
-    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOVE, WM_MOVING, WM_RBUTTONDOWN, WM_SETICON, WM_SIZE, WS_CLIPCHILDREN,
+    GetWindowLongPtrW, IsChild, IsWindowVisible, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
+    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOVE, WM_MOVING,
+    WM_RBUTTONDOWN, WM_SETICON, WM_SIZE, WS_CLIPCHILDREN,
 };
 
 thread_local! {
     /// Controller of the visible tab, so window moves can be forwarded without touching app state.
     static ACTIVE_CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
+    /// The web page window that had keyboard focus when ours was deactivated.
+    static PAGE_FOCUS: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
 }
 
 pub fn set_active_controller(controller: Option<ICoreWebView2Controller>) {
@@ -104,8 +107,22 @@ unsafe extern "system" fn subclass_proc(
         // A click on the Slint UI while the page has keyboard focus: take the focus back,
         // otherwise typing into the address bar would go to the web page.
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => unsafe {
+            PAGE_FOCUS.set(HWND::default());
             if GetFocus() != hwnd {
                 let _ = SetFocus(Some(hwnd));
+            }
+        },
+        // Activation gives focus to the top-level window, so coming back from another app left
+        // the page unable to type into. Like Chrome, remember the page window that had focus on
+        // the way out and hand it back on the way in, after the default handling.
+        WM_ACTIVATE => unsafe {
+            if (wparam.0 & 0xFFFF) as u32 == WA_INACTIVE {
+                let focus = GetFocus();
+                PAGE_FOCUS.set(if IsChild(hwnd, focus).as_bool() { focus } else { HWND::default() });
+            } else {
+                let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                restore_page_focus(hwnd);
+                return result;
             }
         },
         _ => {}
@@ -115,9 +132,23 @@ unsafe extern "system" fn subclass_proc(
 
 /// Moves keyboard focus from the web page back to the Slint window.
 pub fn focus_main_window(hwnd: HWND) {
+    PAGE_FOCUS.set(HWND::default());
     unsafe {
         if GetFocus() != hwnd {
             let _ = SetFocus(Some(hwnd));
+        }
+    }
+}
+
+/// Gives focus back to the page window that had it when the window was deactivated, if focus is
+/// now on the window itself and that page is still alive and shown (the same tab). Also called
+/// after restoring from minimized, because the page is hidden while minimized and only comes
+/// back after activation.
+pub fn restore_page_focus(hwnd: HWND) {
+    unsafe {
+        let page = PAGE_FOCUS.get();
+        if GetFocus() == hwnd && IsChild(hwnd, page).as_bool() && IsWindowVisible(page).as_bool() {
+            let _ = SetFocus(Some(page));
         }
     }
 }

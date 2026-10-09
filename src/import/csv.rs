@@ -112,6 +112,23 @@ mod tests {
     }
 
     #[test]
+    fn chromium_exports_as_written() {
+        // Byte for byte what Chrome 155 and Edge 154 exported on the test VM (Brave matches Edge):
+        // CRLF, quotes only where needed, a CRLF inside the quoted note, an empty trailing note.
+        let chrome = "name,url,username,password,note\r\n\
+                      github.com,https://github.com/login,chrome-user,\"c-pw,1\"\"x\",\"line one\r\n\
+                      line two, with comma\"\r\n";
+        let edge = "name,url,username,password,note\r\n\
+                    stackoverflow.com,https://stackoverflow.com/users/login,edge-user,\"e-pw,4\"\"w\",\r\n";
+        for (csv, user, password) in [(chrome, "chrome-user", "c-pw,1\"x"), (edge, "edge-user", "e-pw,4\"w")] {
+            let logins = parse(csv).unwrap();
+            assert_eq!(logins.len(), 1);
+            assert_eq!(logins[0].username, user);
+            assert_eq!(logins[0].password, password);
+        }
+    }
+
+    #[test]
     fn skips_blank_and_passwordless_rows() {
         let csv = "url,username,password\nhttps://a.com,u,pw\n\n,,,\nhttps://b.com,u,\n";
         assert_eq!(parse(csv).unwrap().len(), 1);

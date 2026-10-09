@@ -793,11 +793,10 @@ impl App {
             UiEvent::AddressEdited(text) => self.on_address_edited(text),
             UiEvent::AddressFocus(focused) => {
                 self.address_focused = focused;
-                if focused {
-                    if let Some(hwnd) = self.hwnd {
-                        win::focus_main_window(hwnd);
-                    }
-                } else if self.suggestions_open {
+                // No SetFocus here: clicks on the bar already take focus (win.rs), and when the
+                // window is re-activated Slint re-focuses the bar on its own, so taking focus
+                // here stole a click that had just landed in the page.
+                if !focused && self.suggestions_open {
                     self.set_suggestions_open(false);
                 }
             }
@@ -1803,6 +1802,7 @@ impl App {
                 self.ui.window().request_redraw();
                 if let Some(hwnd) = self.hwnd {
                     win::repaint_all(hwnd);
+                    win::restore_page_focus(hwnd);
                 }
             }
         }
