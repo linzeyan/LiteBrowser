@@ -177,7 +177,7 @@ mod tests {
         // A glyph is actually inked, not left blank, and stays inside its stroke.
         let glyph = menu_glyph("M 3.5 12 L 20.5 12", 28).unwrap();
         assert_eq!(glyph.rgba.len(), 28 * 28 * 4);
-        assert!(glyph.rgba.chunks_exact(4).any(|p| p[3] > 0));
+        assert!(glyph.rgba.as_chunks::<4>().0.iter().any(|p| p[3] > 0));
         assert_eq!(glyph.rgba[3], 0);
     }
 }

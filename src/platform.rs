@@ -383,8 +383,8 @@ unsafe fn icon_bitmap(icon: &MenuIcon) -> Option<HBITMAP> {
         return None;
     }
     let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, icon.rgba.len());
-    for (bgra, rgba) in pixels.chunks_exact_mut(4).zip(icon.rgba.chunks_exact(4)) {
-        bgra.copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+    for (bgra, rgba) in pixels.as_chunks_mut::<4>().0.iter_mut().zip(icon.rgba.as_chunks::<4>().0) {
+        *bgra = [rgba[2], rgba[1], rgba[0], rgba[3]];
     }
     Some(bitmap)
 }
