@@ -50,6 +50,8 @@ pub enum Event {
     ExtensionChanged(Result<(), String>),
     /// The docked DevTools controller finished being created.
     DevtoolsViewCreated(Result<ICoreWebView2Controller, String>),
+    /// Each renderer PID with the ids of the frames it runs.
+    RendererFrames(Vec<(u32, Vec<u32>)>),
     Tick,
 }
 
@@ -409,6 +411,8 @@ struct Tab {
     favicon: Image,
     /// A private tab: in-memory profile, and nothing is written to history or the session.
     private: bool,
+    /// Memory of the renderers running this tab, from the last measurement; 0 when unknown.
+    bytes: u64,
 }
 
 impl Tab {
@@ -429,6 +433,7 @@ impl Tab {
             recorded_url: String::new(),
             favicon: Image::default(),
             private: false,
+            bytes: 0,
         }
     }
 
@@ -636,6 +641,7 @@ impl App {
                 self.request_extension_list();
             }
             Event::DevtoolsViewCreated(result) => self.on_devtools_view_created(result),
+            Event::RendererFrames(renderers) => self.on_renderer_frames(renderers),
             Event::Tick => self.tick(),
         }
     }
@@ -1275,8 +1281,9 @@ impl App {
         if idx == self.active || tab.creating || tab.view.is_none() {
             return;
         }
-        log!("tab {id}: discarded");
+        log!("tab {id}: discarded ({} MB)", tab.bytes >> 20);
         tab.view = None;
+        tab.bytes = 0;
         tab.suspended = false;
         tab.loading = false;
     }
@@ -1294,6 +1301,13 @@ impl App {
         }
     }
 
+    fn on_renderer_frames(&mut self, renderers: Vec<(u32, Vec<u32>)>) {
+        let frames: Vec<Option<u32>> = self.tabs.iter().map(|t| t.view.as_ref().and_then(WebView::frame_id)).collect();
+        for (tab, bytes) in self.tabs.iter_mut().zip(memory::per_tab(&frames, &renderers, memory::private_memory)) {
+            tab.bytes = bytes;
+        }
+    }
+
     fn apply_policy(&mut self, memory: Option<MemoryState>) {
         let snapshots: Vec<TabSnapshot> = self
             .tabs
@@ -1305,6 +1319,7 @@ impl App {
                 active: i == self.active,
                 pinned: t.pinned,
                 last_active_ms: t.last_active_ms,
+                bytes: t.bytes,
             })
             .collect();
         let actions = tabs::plan(&snapshots, self.now_ms(), memory, &Policy::from_config(&self.cfg));
@@ -1788,6 +1803,10 @@ impl App {
         let sys = platform::system_memory();
         self.system_memory_free = sys.free_bytes;
         self.apply_policy(Some(MemoryState { browser_bytes: self.usage.bytes, system_free_bytes: sys.free_bytes }));
+        // Per-tab sizes for the next round's policy: the answer comes back asynchronously.
+        if let Some(env) = &self.env {
+            webview::renderer_frames(env, |renderers| post(Event::RendererFrames(renderers)));
+        }
         // Every message is a one-off notice ("bookmark added", "private tab: …"); left up, it
         // goes on describing a tab or an action that is long gone.
         if !self.status_message.is_empty() && self.now_ms().saturating_sub(self.status_message_ms) > 8_000 {

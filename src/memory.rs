@@ -79,7 +79,26 @@ fn started(pid: u32) -> Option<u64> {
     }
 }
 
-fn private_memory(pid: u32) -> u64 {
+/// Splits renderer memory over tabs. `tab_frames` is each tab's main frame id (None without a
+/// WebView); `renderers` is each renderer PID with the ids of the frames it runs. Tabs of the
+/// same site share a renderer, so each gets an equal share of it.
+pub fn per_tab(tab_frames: &[Option<u32>], renderers: &[(u32, Vec<u32>)], bytes: impl Fn(u32) -> u64) -> Vec<u64> {
+    let mut out = vec![0; tab_frames.len()];
+    for (pid, frames) in renderers {
+        let owners: Vec<usize> =
+            (0..tab_frames.len()).filter(|&i| tab_frames[i].is_some_and(|f| frames.contains(&f))).collect();
+        if owners.is_empty() {
+            continue;
+        }
+        let share = bytes(*pid) / owners.len() as u64;
+        for i in owners {
+            out[i] += share;
+        }
+    }
+    out
+}
+
+pub fn private_memory(pid: u32) -> u64 {
     unsafe {
         let handle = match OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, false, pid)
             .or_else(|_| OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid))
@@ -125,6 +144,16 @@ mod tests {
             _ => return None,
         });
         assert_eq!(descendants(10, &pairs, started), vec![10, 20, 50]);
+    }
+
+    #[test]
+    fn renderer_memory_is_split_over_the_tabs_it_runs() {
+        // Tabs 0 and 1 are the same site (renderer 100); renderer 200 runs tab 2 plus one of its
+        // iframes (frame 8). Tab 3 has no WebView; renderer 300 runs only a frame we don't know.
+        let tab_frames = [Some(1), Some(2), Some(3), None];
+        let renderers = [(100, vec![1, 2]), (200, vec![3, 8]), (300, vec![9])];
+        let bytes = |pid: u32| u64::from(pid);
+        assert_eq!(per_tab(&tab_frames, &renderers, bytes), vec![50, 50, 200, 0]);
     }
 
     #[test]

@@ -97,6 +97,21 @@ mod tests {
     }
 
     #[test]
+    fn firefox_157_export_as_written() {
+        // Byte for byte what Firefox 157 exported on the test VM: CRLF, every field quoted except
+        // an empty httpRealm, and no line break after the last row.
+        let csv = "\"url\",\"username\",\"password\",\"httpRealm\",\"formActionOrigin\",\"guid\",\"timeCreated\",\
+                   \"timeLastUsed\",\"timePasswordChanged\"\r\n\
+                   \"https://app.clickup.com\",\"firefox-user\",\"f-pw,3\"\"z\",,\"\",\
+                   \"{d98fac0e-f236-46b1-94d4-72ccfee543c4}\",\"1791503149152\",\"1791503149152\",\"1791503149152\"";
+        let logins = parse(csv).unwrap();
+        assert_eq!(logins.len(), 1);
+        assert_eq!(logins[0].origin, "https://app.clickup.com");
+        assert_eq!(logins[0].username, "firefox-user");
+        assert_eq!(logins[0].password, "f-pw,3\"z");
+    }
+
+    #[test]
     fn skips_blank_and_passwordless_rows() {
         let csv = "url,username,password\nhttps://a.com,u,pw\n\n,,,\nhttps://b.com,u,\n";
         assert_eq!(parse(csv).unwrap().len(), 1);

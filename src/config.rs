@@ -14,10 +14,10 @@ pub struct Config {
     pub suspend_after_secs: u64,
     /// A background tab is discarded (WebView destroyed) after this many minutes.
     pub discard_after_mins: u64,
-    /// When the whole browser uses more than this, the least recently used background tab is
-    /// discarded (once it has been in the background for `discard_grace_mins`).
+    /// When the whole browser uses more than this, the largest background tab is discarded.
     pub memory_budget_mb: u64,
-    /// The tab limit and memory budget never discard a tab used within this many minutes.
+    /// The tab limit and memory budget don't discard the two most recently used background tabs
+    /// within this many minutes; they are only frozen.
     pub discard_grace_mins: u64,
     /// When the machine has less free memory than this, background tabs are discarded right away.
     pub low_memory_free_mb: u64,

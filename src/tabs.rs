@@ -9,13 +9,20 @@
 //!     └───────────────────────── user switches back: WebView is recreated ◀──────────────┘
 //! ```
 //! On top of the timers:
-//! - at most `max_live` tabs keep a WebView, and while the browser uses more than the budget the
-//!   least recently used background tab is discarded — but only once it has been in the
-//!   background for `grace`, so switching back and forth between tabs never reloads them;
-//! - when the machine itself runs low on free memory, the least recently used background tab is
-//!   discarded right away.
+//! - at most `max_live` tabs keep a WebView (the least recently used go first), and while the
+//!   browser uses more than the budget the largest background tab is discarded. The
+//!   [`GRACE_TABS`] most recently used background tabs are only frozen until they have been in
+//!   the background for `grace`, so switching back and forth between a few tabs never reloads
+//!   them — while a run of newly visited sites doesn't keep every one of them resident;
+//! - when the machine itself runs low on free memory, the largest background tab is discarded
+//!   right away.
 
 pub type TabId = u64;
+
+/// How many background tabs the grace period protects. Three tabs in rotation stay loaded; on a
+/// VM, ten sites visited in a row kept 800 MB resident for the whole grace period when it
+/// protected every tab.
+const GRACE_TABS: usize = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Residency {
@@ -35,6 +42,8 @@ pub struct TabSnapshot {
     pub pinned: bool,
     /// Last time (ms) this tab was the active tab.
     pub last_active_ms: u64,
+    /// Memory of the renderer processes running this tab; 0 when unknown.
+    pub bytes: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -43,7 +52,7 @@ pub struct Policy {
     pub suspend_after_ms: u64,
     pub discard_after_ms: u64,
     pub budget_bytes: u64,
-    /// Cap and budget only discard tabs that have been in the background at least this long.
+    /// Cap and budget spare the [`GRACE_TABS`] most recently used background tabs for this long.
     pub grace_ms: u64,
     /// Below this much free system memory, discard without waiting for the grace period.
     pub low_free_bytes: u64,
@@ -86,6 +95,14 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
     background.sort_by_key(|t| t.last_active_ms);
 
     let idle = |t: &TabSnapshot| now_ms.saturating_sub(t.last_active_ms);
+    let in_grace: Vec<TabId> = background
+        .iter()
+        .rev()
+        .filter(|t| !t.pinned)
+        .take(GRACE_TABS)
+        .filter(|t| idle(t) < policy.grace_ms)
+        .map(|t| t.id)
+        .collect();
 
     fn discard(t: &TabSnapshot, actions: &mut Vec<Action>, discarded: &mut Vec<TabId>) {
         actions.retain(|a| *a != Action::Suspend(t.id));
@@ -112,7 +129,7 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
         if t.pinned || discarded.contains(&t.id) {
             continue;
         }
-        if idle(t) >= policy.grace_ms {
+        if !in_grace.contains(&t.id) {
             discard(t, &mut actions, &mut discarded);
         } else if t.residency == Residency::Live && !actions.contains(&Action::Suspend(t.id)) {
             actions.push(Action::Suspend(t.id));
@@ -120,12 +137,15 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
         excess -= 1;
     }
 
-    // 3. Memory: one tab per round, so the next measurement can reflect it.
+    // 3. Memory: one tab per round, so the next measurement can reflect it. The largest goes
+    // first: one heavy app frees more than several small pages, which would all have to reload.
+    // Equal or unknown sizes fall back to least recently used.
     if let Some(mem) = memory {
         let candidate = |respect_grace: bool| {
             background
                 .iter()
-                .find(|t| !t.pinned && !discarded.contains(&t.id) && (!respect_grace || idle(t) >= policy.grace_ms))
+                .filter(|t| !t.pinned && !discarded.contains(&t.id) && !(respect_grace && in_grace.contains(&t.id)))
+                .min_by_key(|t| std::cmp::Reverse(t.bytes))
                 .copied()
         };
         let pick = if mem.system_free_bytes > 0 && mem.system_free_bytes < policy.low_free_bytes {
@@ -164,7 +184,7 @@ mod tests {
     }
 
     fn tab(id: TabId, residency: Residency, active: bool, last_active_ms: u64) -> TabSnapshot {
-        TabSnapshot { id, residency, active, pinned: false, last_active_ms }
+        TabSnapshot { id, residency, active, pinned: false, last_active_ms, bytes: 0 }
     }
 
     fn browser(bytes: u64) -> Option<MemoryState> {
@@ -236,6 +256,42 @@ mod tests {
 
         let tabs = [tab(1, Live, true, now), tab(2, Live, false, now - 3 * SEC), tab(3, Suspended, false, now - 6 * MIN)];
         assert_eq!(plan(&tabs, now, None, &policy()), vec![Action::Discard(3)]);
+    }
+
+    #[test]
+    fn a_run_of_new_sites_keeps_only_the_latest_two_loaded() {
+        // Ten sites visited in a row: tabs 1..9 in the background, 9 the most recent. Grace used
+        // to keep all ten resident for five minutes (800 MB measured on a VM).
+        let now = 100 * MIN;
+        let mut tabs: Vec<_> = (1..=9).map(|i| tab(i, Live, false, now - (10 - i) * SEC)).collect();
+        tabs.push(tab(10, Live, true, now));
+        let mut expected: Vec<_> = (1..=7).map(Action::Discard).collect();
+        expected.push(Action::Suspend(8));
+        assert_eq!(plan(&tabs, now, browser(900 * MB), &policy()), expected);
+    }
+
+    #[test]
+    fn over_budget_spares_only_the_latest_two_inside_grace() {
+        let now = 100 * MIN;
+        let tabs = [
+            tab(1, Live, true, now),
+            tab(2, Live, false, now - 3 * SEC),
+            tab(3, Live, false, now - 4 * SEC),
+            tab(4, Live, false, now - 5 * SEC),
+        ];
+        let policy = Policy { max_live: 5, ..policy() };
+        assert_eq!(plan(&tabs, now, browser(900 * MB), &policy), vec![Action::Discard(4)]);
+    }
+
+    #[test]
+    fn memory_pressure_discards_the_largest_tab_first() {
+        // Least recently used would reload the small tab 2 and still be over budget next round.
+        let now = 100 * MIN;
+        let sized = |id, idle, mb| TabSnapshot { bytes: mb * MB, ..tab(id, Suspended, false, now - idle) };
+        let tabs = [tab(1, Live, true, now), sized(2, 10 * MIN, 40), sized(3, 8 * MIN, 120), sized(4, 7 * MIN, 60)];
+        let policy = Policy { max_live: 5, ..policy() };
+        assert_eq!(plan(&tabs, now, browser(900 * MB), &policy), vec![Action::Discard(3)]);
+        assert_eq!(plan(&tabs, now, system_free(100 * MB), &policy), vec![Action::Discard(3)]);
     }
 
     #[test]

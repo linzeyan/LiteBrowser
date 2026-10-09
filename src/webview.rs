@@ -11,7 +11,7 @@ use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
     take_pwstr, AcceleratorKeyPressedEventHandler, BrowserExtensionEnableCompletedHandler, CapturePreviewCompletedHandler,
     ContainsFullScreenElementChangedEventHandler,
-    ExecuteScriptCompletedHandler,
+    ExecuteScriptCompletedHandler, GetProcessExtendedInfosCompletedHandler,
     BrowserExtensionRemoveCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
     GetFaviconCompletedHandler, HistoryChangedEventHandler, NavigationCompletedEventHandler,
@@ -542,6 +542,66 @@ impl WebView {
         let wv13 = self.core.cast::<ICoreWebView2_13>().ok()?;
         unsafe { wv13.Profile().ok()?.cast::<ICoreWebView2Profile7>().ok() }
     }
+
+    /// The main frame's id, the same kind of id [`renderer_frames`] reports. Needs ICoreWebView2_20.
+    pub fn frame_id(&self) -> Option<u32> {
+        let wv20 = self.core.cast::<ICoreWebView2_20>().ok()?;
+        let mut id = 0;
+        unsafe { wv20.FrameId(&mut id) }.ok()?;
+        Some(id)
+    }
+}
+
+/// Which frames each renderer process runs: `done` gets every renderer's PID with the ids of its
+/// frames. Needs ICoreWebView2Environment13; older runtimes never call `done`.
+// ponytail: only a page's main frame matches a tab, so a cross-site iframe in a renderer of its
+// own isn't counted for its page; walk `ICoreWebView2FrameInfo2::ParentFrameInfo` up to the main
+// frame if the largest-first ranking turns out wrong.
+pub fn renderer_frames(env: &ICoreWebView2Environment, done: impl FnOnce(Vec<(u32, Vec<u32>)>) + 'static) {
+    let Ok(env13) = env.cast::<ICoreWebView2Environment13>() else { return };
+    let handler = GetProcessExtendedInfosCompletedHandler::create(Box::new(move |result, infos| {
+        if let (Ok(()), Some(infos)) = (result, infos) {
+            done(unsafe { read_renderers(&infos) });
+        }
+        Ok(())
+    }));
+    unsafe {
+        let _ = env13.GetProcessExtendedInfos(&handler);
+    }
+}
+
+unsafe fn read_renderers(infos: &ICoreWebView2ProcessExtendedInfoCollection) -> Vec<(u32, Vec<u32>)> {
+    let mut out = Vec::new();
+    let mut count = 0;
+    let _ = infos.Count(&mut count);
+    for i in 0..count {
+        let Ok(info) = infos.GetValueAtIndex(i) else { continue };
+        let Ok(process) = info.ProcessInfo() else { continue };
+        let (mut kind, mut pid) = (COREWEBVIEW2_PROCESS_KIND::default(), 0);
+        if process.Kind(&mut kind).is_err() || kind != COREWEBVIEW2_PROCESS_KIND_RENDERER || process.ProcessId(&mut pid).is_err() {
+            continue;
+        }
+        let mut frames = Vec::new();
+        // Keep the collection alive while iterating: WebView2 154's iterator doesn't hold a
+        // reference to it, and iterating after dropping it crashed in EmbeddedBrowserWebView.dll.
+        let collection = info.AssociatedFrameInfos().ok();
+        if let Some(iter) = collection.as_ref().and_then(|c| c.GetIterator().ok()) {
+            let mut has = BOOL(0);
+            while iter.HasCurrent(&mut has).is_ok() && has.as_bool() {
+                if let Some(info2) = iter.GetCurrent().ok().and_then(|f| f.cast::<ICoreWebView2FrameInfo2>().ok()) {
+                    let mut id = 0;
+                    if info2.FrameId(&mut id).is_ok() && id != 0 {
+                        frames.push(id);
+                    }
+                }
+                if iter.MoveNext(&mut has).is_err() {
+                    break;
+                }
+            }
+        }
+        out.push((pid as u32, frames));
+    }
+    out
 }
 
 /// Answers requests to blocked domains with an empty 403 instead of letting them out.
