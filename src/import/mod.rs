@@ -101,7 +101,20 @@ pub fn origin_of(url: &str) -> Option<String> {
 pub struct ImportData {
     pub bookmarks: Vec<ImportedBookmark>,
     pub history: Vec<ImportedVisit>,
+    /// Site icons as (page URL, image bytes), the size closest to 32 px first.
+    pub icons: Vec<(String, Vec<u8>)>,
     pub errors: Vec<String>,
+}
+
+/// Icons are cosmetic: a missing or unreadable icon database must not turn the import into an
+/// error, so failures just yield no icons.
+fn read_icons(src: &Path, scratch: &Path, name: &str, sql: &str) -> Vec<(String, Vec<u8>)> {
+    let Ok(db) = copy_db(src, scratch, name) else { return Vec::new() };
+    let Ok(conn) = open_db(&db) else { return Vec::new() };
+    let Ok(mut stmt) = conn.prepare(sql) else { return Vec::new() };
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
 }
 
 #[derive(Clone, Copy, Debug, Default)]

@@ -402,7 +402,8 @@ impl WebView {
 
     pub fn navigate(&self, url: &str) {
         if let Err(e) = unsafe { self.core.Navigate(&HSTRING::from(url)) } {
-            log!("navigate to {url} failed: {}", hresult_message(&e));
+            // No URL in the log: it may be a private tab's.
+            log!("navigate failed: {}", hresult_message(&e));
         }
     }
 

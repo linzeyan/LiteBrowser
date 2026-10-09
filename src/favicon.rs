@@ -1,7 +1,7 @@
 //! Site icons: decode the PNG that WebView2 hands us, cache it per host in memory and on disk,
 //! and expose it as a `slint::Image` for the tab strip, bookmarks and history.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
@@ -61,6 +61,19 @@ impl FaviconCache {
         self.by_host.insert(host, img.clone());
         Some(img)
     }
+
+    /// Takes icons imported from another browser, best size first: the first one per host that
+    /// decodes wins. Only for `hosts`, and never over an icon we already have, which is fresher.
+    pub fn import(&mut self, icons: &[(String, Vec<u8>)], hosts: &HashSet<String>) -> usize {
+        let mut added = 0;
+        for (url, bytes) in icons {
+            let Some(host) = url_input::host_of(url) else { continue };
+            if hosts.contains(&host) && self.get(url).is_none() && self.store(url, bytes).is_some() {
+                added += 1;
+            }
+        }
+        added
+    }
 }
 
 /// Decodes PNG bytes into a Slint RGBA image. Handles RGBA, RGB and grayscale 8-bit PNGs.
@@ -89,4 +102,42 @@ pub fn decode_png(bytes: &[u8]) -> Option<Image> {
     }
     let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&rgba, w, h);
     Some(Image::from_rgba8(buffer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn png(size: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut encoder = png::Encoder::new(&mut out, size, size);
+        encoder.set_color(png::ColorType::Rgba);
+        let mut writer = encoder.write_header().unwrap();
+        writer.write_image_data(&vec![255; (size * size * 4) as usize]).unwrap();
+        writer.finish().unwrap();
+        out
+    }
+
+    #[test]
+    fn import_takes_the_best_drawable_icon_per_bookmarked_host() {
+        let dir = std::env::temp_dir().join(format!("litebrowser-favicon-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cache = FaviconCache::new(dir.clone());
+        cache.store("https://visited.example/", &png(8));
+        let hosts: HashSet<String> = ["a.example", "visited.example"].map(String::from).into();
+        let icons = vec![
+            // Firefox keeps SVG icons too; we cannot draw them, so the next one must be used.
+            ("https://a.example/page".to_string(), b"<svg/>".to_vec()),
+            ("https://a.example/".to_string(), png(32)),
+            ("https://a.example/other".to_string(), png(16)),
+            ("https://visited.example/".to_string(), png(32)),
+            ("https://not-bookmarked.example/".to_string(), png(32)),
+        ];
+        assert_eq!(cache.import(&icons, &hosts), 1);
+        assert_eq!(cache.get("https://a.example/x").unwrap().size().width, 32);
+        // An icon LiteBrowser fetched itself is newer than anything in another browser's cache.
+        assert_eq!(cache.get("https://visited.example/").unwrap().size().width, 8);
+        assert!(cache.get("https://not-bookmarked.example/").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -62,6 +62,15 @@ pub fn read(profile: &Profile, what: Selection, scratch: &Path) -> ImportData {
             Err(e) => data.errors.push(e),
         }
     }
+    if what.bookmarks || what.history {
+        data.icons = super::read_icons(
+            &profile.dir.join("Favicons"),
+            scratch,
+            "chromium-favicons.sqlite",
+            "SELECT m.page_url, b.image_data FROM icon_mapping m JOIN favicon_bitmaps b ON b.icon_id = m.icon_id \
+             WHERE b.image_data IS NOT NULL ORDER BY abs(b.width - 32)",
+        );
+    }
     data
 }
 
@@ -102,8 +111,9 @@ fn walk_bookmarks(node: &serde_json::Value, folder: &str, out: &mut Vec<Imported
             }
         }
         Some("folder") => {
-            let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let sub = if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") };
+            // "/" separates path segments, so a slash inside a name becomes a full-width one.
+            let name = node.get("name").and_then(|v| v.as_str()).unwrap_or("").replace('/', "／");
+            let sub = if folder.is_empty() { name } else { format!("{folder}/{name}") };
             if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
                 for child in children {
                     walk_bookmarks(child, &sub, out);

@@ -14,8 +14,8 @@ use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, SendMessageW, SetForegroundWindow,
-    TrackPopupMenuEx, HMENU, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, MF_STRING, TPM_RETURNCMD,
-    TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WM_COPYDATA,
+    TrackPopupMenuEx, HMENU, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WM_COPYDATA,
 };
 
 /// A hidden window class/title used to find a running instance. Also the WM_COPYDATA tag.
@@ -125,6 +125,7 @@ fn send_to_existing(url: Option<&str>) {
 pub enum MenuItem {
     Entry { id: u32, label: String, checked: bool, enabled: bool },
     Separator,
+    Submenu { label: String, items: Vec<MenuItem> },
 }
 
 impl MenuItem {
@@ -152,13 +153,15 @@ pub fn popup_menu(items: &[MenuItem]) -> u32 {
     track_menu(items, pt, TPM_RETURNCMD | TPM_RIGHTBUTTON)
 }
 
-/// Like `popup_menu`, but with the menu's top-right corner at (x, y) of the owner's client area,
-/// in physical pixels: how Chrome drops its main menu below the ⋮ button.
-pub fn popup_menu_below(items: &[MenuItem], x: i32, y: i32) -> u32 {
+/// Like `popup_menu`, but hanging from (x, y) of the owner's client area, in physical pixels: by
+/// its top-right corner for Chrome's main menu below the ⋮ button, by its top-left corner for a
+/// bookmarks-bar folder.
+pub fn popup_menu_below(items: &[MenuItem], x: i32, y: i32, right_aligned: bool) -> u32 {
     let Some(owner) = OWNER.with(|o| *o.borrow()) else { return 0 };
     let mut pt = POINT { x, y };
     let _ = unsafe { ClientToScreen(owner, &mut pt) };
-    track_menu(items, pt, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_RIGHTALIGN | TPM_TOPALIGN)
+    let align = if right_aligned { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
+    track_menu(items, pt, TPM_RETURNCMD | TPM_RIGHTBUTTON | align | TPM_TOPALIGN)
 }
 
 fn track_menu(items: &[MenuItem], pt: POINT, flags: TRACK_POPUP_MENU_FLAGS) -> u32 {
@@ -306,6 +309,15 @@ unsafe fn append(menu: HMENU, item: &MenuItem) {
             }
             let text = HSTRING::from(label.as_str());
             let _ = AppendMenuW(menu, flags, *id as usize, &text);
+        }
+        MenuItem::Submenu { label, items } => {
+            // Destroying the parent menu destroys attached submenus too.
+            let Ok(sub) = CreatePopupMenu() else { return };
+            for item in items {
+                append(sub, item);
+            }
+            let text = HSTRING::from(label.as_str());
+            let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &text);
         }
     }
 }

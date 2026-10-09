@@ -29,6 +29,15 @@ export struct LinkData {
     favicon: image,
 }
 
+// A bookmarks-bar chip: a bookmark (index into the bookmarks) or a folder (url = its path).
+export struct BarItemData {
+    title: string,
+    url: string,
+    favicon: image,
+    index: int,
+    folder: bool,
+}
+
 export struct ImportProfileData {
     // Stable id Rust uses to find the profile again.
     id: int,
@@ -64,28 +73,38 @@ export struct SettingsData {
 }
 
 global Theme {
-    out property <color> frame: #dde3e9;
-    out property <color> surface: #ffffff;
+    // While a private tab is in front, everything goes dark, like Chrome's incognito window
+    // (dark values sampled off Chrome 155's).
+    in-out property <bool> incognito;
+    out property <color> frame: incognito ? #2b2b2b : #dde3e9;
+    out property <color> surface: incognito ? #3c3c3c : #ffffff;
     // Behind the cards of internal pages.
-    out property <color> page: #f3f6fb;
-    out property <color> field: #edf2fa;
-    out property <color> field-hover: #e2e8f1;
-    out property <color> text: #1f1f1f;
-    out property <color> icon: #474747;
-    out property <color> dim: #5e5e5e;
-    out property <color> disabled: #b0b3b6;
-    out property <color> hover: #1f1f1f14;
-    out property <color> pressed: #1f1f1f24;
-    out property <color> row-hover: #1f1f1f0a;
-    out property <color> border: #e1e3e1;
-    out property <color> outline: #c4c7c5;
-    out property <color> separator: #c7c7c7;
+    out property <color> page: incognito ? #282828 : #f3f6fb;
+    out property <color> field: incognito ? #282828 : #edf2fa;
+    out property <color> field-hover: incognito ? #323232 : #e2e8f1;
+    out property <color> text: incognito ? #e3e3e3 : #1f1f1f;
+    out property <color> icon: incognito ? #c7c7c7 : #474747;
+    out property <color> dim: incognito ? #ababab : #5e5e5e;
+    out property <color> disabled: incognito ? #6b6b6b : #b0b3b6;
+    out property <color> hover: incognito ? #ffffff1a : #1f1f1f14;
+    out property <color> pressed: incognito ? #ffffff29 : #1f1f1f24;
+    out property <color> row-hover: incognito ? #ffffff0f : #1f1f1f0a;
+    out property <color> border: incognito ? #444746 : #e1e3e1;
+    out property <color> outline: incognito ? #5e5e5e : #c4c7c5;
+    out property <color> separator: incognito ? #5e5e5e : #c7c7c7;
     // A hovered background tab, as a solid color so its title fade can blend into it.
-    out property <color> tab-hover: #ecf0f3;
+    out property <color> tab-hover: incognito ? #333333 : #ecf0f3;
     out property <color> private-tab: #46465a;
     out property <color> private-tab-hover: #55556a;
-    out property <color> accent: #0b57d0;
-    out property <color> danger: #c42b1c;
+    out property <color> accent: incognito ? #a8c7fa : #0b57d0;
+    out property <color> accent-hover: incognito ? #bcd3fb : #1a62d6;
+    out property <color> accent-pressed: incognito ? #d3e3fd : #0a4cb8;
+    // Text on an accent-filled button.
+    out property <color> on-accent: incognito ? #062e6f : #ffffff;
+    out property <color> danger: incognito ? #f2b8b5 : #c42b1c;
+    out property <color> selection: incognito ? #4a6290 : #a8c7fa;
+    // The disc behind a new-tab tile's icon.
+    out property <color> tile: incognito ? #4a4a4a : #f1f3f4;
 }
 
 global Icons {
@@ -107,6 +126,7 @@ global Icons {
     out property <string> globe: "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 3.5 12 L 20.5 12 M 12 3.5 A 5 8.5 0 0 0 12 20.5 A 5 8.5 0 0 0 12 3.5";
     out property <string> import: "M 12 3 L 12 15 M 7 10 L 12 15 L 17 10 M 4 20 L 20 20";
     out property <string> edit: "M 4 20 L 8 19 L 19.5 7.5 A 2 2 0 0 0 16.5 4.5 L 5 16 Z M 15 6 L 18 9";
+    out property <string> folder: "M 3.5 6.5 A 1.5 1.5 0 0 1 5 5 L 9.5 5 L 11.5 7 L 19 7 A 1.5 1.5 0 0 1 20.5 8.5 L 20.5 17.5 A 1.5 1.5 0 0 1 19 19 L 5 19 A 1.5 1.5 0 0 1 3.5 17.5 Z";
     // Caption glyphs, drawn in a 10x10 box.
     out property <string> private: "M 2 9 L 22 9 M 3 9 A 4.5 4.5 0 0 0 10 15 L 14 15 A 4.5 4.5 0 0 0 21 9 M 7 9 L 9 5 L 15 5 L 17 9";
     out property <string> caption-minimize: "M 0 5 L 10 5";
@@ -231,7 +251,8 @@ component TabItem inherits Rectangle {
     callback close;
     callback context-menu;
 
-    // A private tab is dark while in the background; once active it joins the white toolbar.
+    // A private tab is dark while in the background; once active it joins the toolbar, which
+    // turns dark with it (Theme.incognito).
     property <bool> dark: root.tab.private && !root.active;
     // The solid color behind the title, for its fade-out.
     property <color> fill: root.active ? Theme.surface
@@ -581,8 +602,8 @@ component PillButton inherits Rectangle {
     border-width: root.primary ? 0px : 1px;
     border-color: Theme.outline;
     background: root.primary
-        ? (!root.enabled ? Theme.hover : touch.pressed ? #0a4cb8 : touch.has-hover ? #1a62d6 : Theme.accent)
-        : (root.enabled && touch.pressed ? #0b57d024 : root.enabled && touch.has-hover ? #0b57d014 : transparent);
+        ? (!root.enabled ? Theme.hover : touch.pressed ? Theme.accent-pressed : touch.has-hover ? Theme.accent-hover : Theme.accent)
+        : (root.enabled && touch.pressed ? Theme.accent.with-alpha(0.14) : root.enabled && touch.has-hover ? Theme.accent.with-alpha(0.08) : transparent);
 
     touch := TouchArea {
         enabled: root.enabled;
@@ -596,7 +617,7 @@ component PillButton inherits Rectangle {
         height: 100%;
         text: root.text;
         font-weight: 600;
-        color: !root.enabled ? Theme.disabled : root.primary ? #ffffff : Theme.accent;
+        color: !root.enabled ? Theme.disabled : root.primary ? Theme.on-accent : Theme.accent;
         horizontal-alignment: center;
         vertical-alignment: center;
     }
@@ -796,7 +817,7 @@ component NtpTile inherits Rectangle {
         width: 48px;
         height: 48px;
         border-radius: 24px;
-        background: #f1f3f4;
+        background: Theme.tile;
         if root.link.favicon.width > 0: Image {
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
@@ -857,6 +878,7 @@ export component AppWindow inherits Window {
     in property <[SuggestionData]> suggestions;
     in-out property <int> selected-suggestion: -1;
     in property <[LinkData]> bookmark-items;
+    in property <[BarItemData]> bar-items;
     in property <[LinkData]> history-items;
     in property <[LinkData]> top-sites;
     in property <[ExtensionData]> extensions;
@@ -921,7 +943,12 @@ export component AppWindow inherits Window {
     callback close-suggestions();
     callback show-page(Page);
     callback remove-bookmark(int);
-    callback save-bookmark(int, string, string);
+    callback save-bookmark(int, string, string, string);
+    // Right-click on a bookmarks-bar chip; a native menu, for the same reason as address-menu().
+    callback bookmark-menu(int);
+    // A bookmarks-bar folder was clicked: its path and the chip's bottom-left corner in window
+    // coordinates, where its native menu hangs from.
+    callback bookmark-folder-menu(string, length, length);
     callback history-search(string);
     callback remove-history(string);
     callback clear-history();
@@ -976,6 +1003,13 @@ export component AppWindow inherits Window {
 
     init => {
         Palette.color-scheme = ColorScheme.light;
+    }
+
+    property <bool> incognito: root.tabs[root.active-tab].private;
+    changed incognito => {
+        Theme.incognito = self.incognito;
+        // The std widgets (fields, checkboxes, scrollbars) of internal pages follow along.
+        Palette.color-scheme = self.incognito ? ColorScheme.dark : ColorScheme.light;
     }
 
     keys := FocusScope {
@@ -1305,7 +1339,7 @@ export component AppWindow inherits Window {
             }
 
             // ---------------- bookmarks bar ----------------
-            if !root.fullscreen && root.settings.show-bookmarks-bar && root.bookmark-items.length > 0: Rectangle {
+            if !root.fullscreen && root.settings.show-bookmarks-bar && root.bar-items.length > 0: Rectangle {
                 height: 32px;
                 background: Theme.surface;
                 clip: true;
@@ -1318,20 +1352,26 @@ export component AppWindow inherits Window {
                     spacing: 2px;
                     alignment: start;
 
-                    for b in root.bookmark-items: Rectangle {
+                    for b in root.bar-items: Rectangle {
                         // A bookmark with no real name (title == url) shows just its site icon.
-                        property <bool> named: b.title != "" && b.title != b.url;
+                        property <bool> named: b.folder || (b.title != "" && b.title != b.url);
                         border-radius: 14px;
                         background: chip-touch.pressed ? Theme.pressed : chip-touch.has-hover ? Theme.hover : transparent;
                         max-width: 180px;
 
                         chip-touch := TouchArea {
                             clicked => {
-                                root.open-url(b.url);
+                                if (b.folder) {
+                                    root.bookmark-folder-menu(b.url, parent.absolute-position.x, parent.absolute-position.y + parent.height);
+                                } else {
+                                    root.open-url(b.url);
+                                }
                             }
                             pointer-event(e) => {
-                                if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+                                if (!b.folder && e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
                                     root.open-url-new-tab(b.url);
+                                } else if (!b.folder && e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
+                                    root.bookmark-menu(b.index);
                                 }
                             }
                         }
@@ -1354,7 +1394,7 @@ export component AppWindow inherits Window {
                                     height: 16px;
                                     viewbox-width: 24;
                                     viewbox-height: 24;
-                                    commands: Icons.globe;
+                                    commands: b.folder ? Icons.folder : Icons.globe;
                                     stroke: Theme.icon;
                                     stroke-width: 1.4px;
                                     stroke-line-cap: round;
@@ -1628,6 +1668,7 @@ export component AppWindow inherits Window {
                                         height: parent.height;
                                         title: b.title;
                                         url: b.url;
+                                        detail: b.detail;
                                         favicon: b.favicon;
                                         icon: Icons.bookmarks;
                                         editable: true;
@@ -1656,21 +1697,32 @@ export component AppWindow inherits Window {
                                         padding-bottom: 6px;
 
                                         title-edit := LineEdit {
-                                            horizontal-stretch: 1;
+                                            horizontal-stretch: 2;
                                             placeholder-text: "名稱";
                                             text: b.title == b.url ? "" : b.title;
                                             accepted => {
-                                                root.save-bookmark(i, self.text, url-edit.text);
+                                                root.save-bookmark(i, self.text, url-edit.text, folder-edit.text);
                                                 root.editing-bookmark = -1;
                                             }
                                         }
 
                                         url-edit := LineEdit {
-                                            horizontal-stretch: 2;
+                                            horizontal-stretch: 3;
                                             placeholder-text: "網址";
                                             text: b.url;
                                             accepted => {
-                                                root.save-bookmark(i, title-edit.text, self.text);
+                                                root.save-bookmark(i, title-edit.text, self.text, folder-edit.text);
+                                                root.editing-bookmark = -1;
+                                            }
+                                        }
+
+                                        // Typing a new name makes a new folder; "/" nests one.
+                                        folder-edit := LineEdit {
+                                            horizontal-stretch: 2;
+                                            placeholder-text: "資料夾（空白＝書籤列）";
+                                            text: b.detail;
+                                            accepted => {
+                                                root.save-bookmark(i, title-edit.text, url-edit.text, self.text);
                                                 root.editing-bookmark = -1;
                                             }
                                         }
@@ -1681,7 +1733,7 @@ export component AppWindow inherits Window {
                                                 text: "儲存";
                                                 primary: true;
                                                 clicked => {
-                                                    root.save-bookmark(i, title-edit.text, url-edit.text);
+                                                    root.save-bookmark(i, title-edit.text, url-edit.text, folder-edit.text);
                                                     root.editing-bookmark = -1;
                                                 }
                                             }
@@ -2395,7 +2447,7 @@ export component AppWindow inherits Window {
                             // text is painted in these colours, so a Ctrl+L selection would sit
                             // over the trimmed address as a highlighted full URL. Chrome shows no
                             // selection in an unfocused omnibox.
-                            selection-background-color: self.has-focus ? #a8c7fa : transparent;
+                            selection-background-color: self.has-focus ? Theme.selection : transparent;
                             selection-foreground-color: self.color;
                             text <=> root.address;
                             cursor-position-changed(pos) => {

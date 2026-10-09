@@ -5,7 +5,7 @@
 //! re-entered while it is already running.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -17,14 +17,14 @@ use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::adblock::Blocklist;
 use crate::config::Config;
-use crate::favicon::FaviconCache;
+use crate::favicon::{self, FaviconCache};
 use crate::import::{self, Profile};
 use crate::logging::{self, log};
 use crate::memory;
 use crate::paths::Paths;
 use crate::platform::{self, MenuItem};
 use crate::shortcuts::{self, Shortcut};
-use crate::storage::{self, Bookmarks, History, Session, SessionTab, SuggestionKind, WindowState};
+use crate::storage::{self, Bookmarks, FolderEntry, History, Session, SessionTab, SuggestionKind, WindowState};
 use crate::tabs::{self, Action, MemoryState, Policy, Residency, TabId, TabSnapshot};
 use crate::url_input;
 use crate::webview::{self, EngineEvent, ExtensionChange, ExtensionInfo, NewWindowRequest, WebView};
@@ -71,7 +71,10 @@ pub enum UiEvent {
     CloseSuggestions,
     ShowPage(Page),
     RemoveBookmark(usize),
-    SaveBookmark { index: usize, title: String, url: String },
+    SaveBookmark { index: usize, title: String, url: String, folder: String },
+    BookmarkMenu(usize),
+    /// A bookmarks-bar folder: its path and the chip's bottom-left corner, logical pixels.
+    BookmarkFolderMenu(String, f32, f32),
     HistorySearch(String),
     RemoveHistory(String),
     ClearHistory,
@@ -336,9 +339,11 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_close_suggestions(|| ui_post(UiEvent::CloseSuggestions));
     ui.on_show_page(|page| ui_post(UiEvent::ShowPage(page)));
     ui.on_remove_bookmark(|i| ui_post(UiEvent::RemoveBookmark(i.max(0) as usize)));
-    ui.on_save_bookmark(|i, title, url| {
-        ui_post(UiEvent::SaveBookmark { index: i.max(0) as usize, title: title.into(), url: url.into() })
+    ui.on_save_bookmark(|i, title, url, folder| {
+        ui_post(UiEvent::SaveBookmark { index: i.max(0) as usize, title: title.into(), url: url.into(), folder: folder.into() })
     });
+    ui.on_bookmark_menu(|i| ui_post(UiEvent::BookmarkMenu(i.max(0) as usize)));
+    ui.on_bookmark_folder_menu(|path, x, y| ui_post(UiEvent::BookmarkFolderMenu(path.into(), x, y)));
     ui.on_history_search(|q| ui_post(UiEvent::HistorySearch(q.into())));
     ui.on_remove_history(|url| ui_post(UiEvent::RemoveHistory(url.into())));
     ui.on_clear_history(|| ui_post(UiEvent::ClearHistory));
@@ -457,6 +462,7 @@ struct Models {
     tabs: Rc<VecModel<TabData>>,
     suggestions: Rc<VecModel<SuggestionData>>,
     bookmarks: Rc<VecModel<LinkData>>,
+    bar: Rc<VecModel<BarItemData>>,
     history: Rc<VecModel<LinkData>>,
     top_sites: Rc<VecModel<LinkData>>,
     extensions: Rc<VecModel<ExtensionData>>,
@@ -526,6 +532,7 @@ impl App {
             tabs: Rc::new(VecModel::default()),
             suggestions: Rc::new(VecModel::default()),
             bookmarks: Rc::new(VecModel::default()),
+            bar: Rc::new(VecModel::default()),
             history: Rc::new(VecModel::default()),
             top_sites: Rc::new(VecModel::default()),
             extensions: Rc::new(VecModel::default()),
@@ -534,6 +541,7 @@ impl App {
         ui.set_tabs(ModelRc::from(models.tabs.clone()));
         ui.set_suggestions(ModelRc::from(models.suggestions.clone()));
         ui.set_bookmark_items(ModelRc::from(models.bookmarks.clone()));
+        ui.set_bar_items(ModelRc::from(models.bar.clone()));
         ui.set_history_items(ModelRc::from(models.history.clone()));
         ui.set_top_sites(ModelRc::from(models.top_sites.clone()));
         ui.set_extensions(ModelRc::from(models.extensions.clone()));
@@ -815,12 +823,14 @@ impl App {
                 self.refresh_bookmarks();
                 self.refresh_toolbar();
             }
-            UiEvent::SaveBookmark { index, title, url } => {
-                self.bookmarks.update(index, &title, &url);
+            UiEvent::SaveBookmark { index, title, url, folder } => {
+                self.bookmarks.update(index, &title, &url, &folder);
                 self.bookmarks.save_if_dirty();
                 self.refresh_bookmarks();
                 self.refresh_toolbar();
             }
+            UiEvent::BookmarkMenu(i) => self.bookmark_menu(i),
+            UiEvent::BookmarkFolderMenu(path, x, y) => self.bookmark_folder_menu(&path, x, y),
             UiEvent::HistorySearch(q) => {
                 self.history_query = q;
                 self.refresh_history();
@@ -1439,6 +1449,15 @@ impl App {
             }
             EngineEvent::Favicon(bytes) => {
                 let url = self.tabs[idx].url.clone();
+                // The disk cache would record a private visit, so a private tab's icon lives
+                // only on that tab.
+                if self.tabs[idx].private {
+                    if let Some(image) = favicon::decode_png(&bytes) {
+                        self.tabs[idx].favicon = image;
+                        self.refresh_tabs();
+                    }
+                    return;
+                }
                 if let Some(image) = self.favicons.store(&url, &bytes) {
                     // Apply to every tab on the same host.
                     let host = url_input::host_of(&url);
@@ -1448,8 +1467,11 @@ impl App {
                         }
                     }
                     self.refresh_tabs();
-                    if matches!(self.page, Page::Bookmarks | Page::History | Page::NewTab) {
+                    // The bookmarks bar is always on screen, so it cannot wait for a page switch.
+                    if self.bookmarks.items().iter().any(|b| url_input::host_of(&b.url) == host) {
                         self.refresh_bookmarks();
+                    }
+                    if matches!(self.page, Page::History | Page::NewTab) {
                         self.refresh_history();
                         self.refresh_top_sites();
                     }
@@ -1911,18 +1933,36 @@ impl App {
     }
 
     fn refresh_bookmarks(&mut self) {
-        let entries: Vec<(String, String)> =
-            self.bookmarks.items().iter().map(|b| (b.title.clone(), b.url.clone())).collect();
+        let entries: Vec<(String, String, String)> =
+            self.bookmarks.items().iter().map(|b| (b.title.clone(), b.url.clone(), b.folder.clone())).collect();
         let items: Vec<LinkData> = entries
             .into_iter()
-            .map(|(title, url)| LinkData {
+            .map(|(title, url, folder)| LinkData {
                 title: title.into(),
-                detail: SharedString::new(),
+                detail: folder.into(),
                 favicon: self.favicons.get(&url).unwrap_or_default(),
                 url: url.into(),
             })
             .collect();
+        let bar: Vec<BarItemData> = self
+            .bookmarks
+            .folder_entries("")
+            .into_iter()
+            .map(|entry| match entry {
+                FolderEntry::Bookmark(i) => BarItemData {
+                    title: items[i].title.clone(),
+                    url: items[i].url.clone(),
+                    favicon: items[i].favicon.clone(),
+                    index: i as i32,
+                    folder: false,
+                },
+                FolderEntry::Folder(path, name) => {
+                    BarItemData { title: name.into(), url: path.into(), favicon: Image::default(), index: -1, folder: true }
+                }
+            })
+            .collect();
         self.models.bookmarks.set_vec(items);
+        self.models.bar.set_vec(bar);
     }
 
     fn refresh_history(&mut self) {
@@ -2019,6 +2059,55 @@ impl App {
             9 => self.run_shortcut(Shortcut::ReopenClosedTab),
             10 => self.run_shortcut(Shortcut::NewPrivateTab),
             _ => {}
+        }
+    }
+
+    fn bookmark_menu(&mut self, idx: usize) {
+        let Some(url) = self.bookmarks.items().get(idx).map(|b| b.url.clone()) else { return };
+        let menu = vec![
+            MenuItem::entry(1, "開啟"),
+            MenuItem::entry(2, "在新分頁中開啟"),
+            MenuItem::Separator,
+            MenuItem::entry(3, "編輯…"),
+            MenuItem::entry(4, "刪除"),
+        ];
+        match platform::popup_menu(&menu) {
+            1 => self.open_url(url),
+            2 => self.handle_ui(UiEvent::OpenUrlNewTab(url)),
+            3 => {
+                // Reuses the bookmarks page's inline editor; show_page on the open page would
+                // toggle back to the web page instead.
+                if self.page != Page::Bookmarks {
+                    self.show_page(Page::Bookmarks);
+                }
+                self.ui.set_editing_bookmark(idx as i32);
+            }
+            4 => self.handle_ui(UiEvent::RemoveBookmark(idx)),
+            _ => {}
+        }
+    }
+
+    /// A bookmarks-bar folder drops down as a native menu (a Slint one would sink under the
+    /// WebView), its subfolders as submenus. Item ids are bookmark index + 1.
+    fn bookmark_folder_menu(&mut self, path: &str, x: f32, y: f32) {
+        fn build(bookmarks: &Bookmarks, path: &str) -> Vec<MenuItem> {
+            bookmarks
+                .folder_entries(path)
+                .into_iter()
+                .map(|entry| match entry {
+                    FolderEntry::Bookmark(i) => MenuItem::entry(i as u32 + 1, bookmarks.items()[i].title.replace('&', "&&")),
+                    FolderEntry::Folder(sub, name) => {
+                        MenuItem::Submenu { label: name.replace('&', "&&"), items: build(bookmarks, &sub) }
+                    }
+                })
+                .collect()
+        }
+        let menu = build(&self.bookmarks, path);
+        let scale = self.ui.window().scale_factor();
+        let chosen = platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32, false);
+        if let Some(b) = (chosen as usize).checked_sub(1).and_then(|i| self.bookmarks.items().get(i)) {
+            let url = b.url.clone();
+            self.open_url(url);
         }
     }
 
@@ -2127,15 +2216,18 @@ impl App {
         }
         let what = import::Selection { bookmarks: want_bookmarks, history: want_history };
         let scratch = self.paths.root.join("import-tmp");
-        let (mut n_bm, mut n_hist, mut errors) = (0usize, 0usize, Vec::new());
+        let (mut n_bm, mut n_hist, mut errors, mut icons) = (0usize, 0usize, Vec::new(), Vec::new());
         let now = storage::now_secs();
         for i in selected {
             let profile = self.import_profiles[i].clone();
             let data = import::read_profile(&profile, what, &scratch);
             errors.extend(data.errors);
+            icons.extend(data.icons);
             for b in data.bookmarks {
-                if !self.bookmarks.contains(&b.url) {
-                    self.bookmarks.toggle(&b.url, &b.title);
+                if self.bookmarks.contains(&b.url) {
+                    self.bookmarks.file_if_loose(&b.url, &b.folder);
+                } else {
+                    self.bookmarks.add(&b.url, &b.title, &b.folder);
                     n_bm += 1;
                 }
             }
@@ -2145,6 +2237,17 @@ impl App {
             }
         }
         let _ = std::fs::remove_dir_all(&scratch);
+        // Icons for what is on screen right after the import (bookmarks, new-tab tiles), so they
+        // don't stay globes until each site is visited. The rest arrive as sites are visited.
+        let hosts: HashSet<String> = self
+            .bookmarks
+            .items()
+            .iter()
+            .map(|b| b.url.as_str())
+            .chain(self.history.top_sites(8).into_iter().map(|h| h.url.as_str()))
+            .filter_map(url_input::host_of)
+            .collect();
+        self.favicons.import(&icons, &hosts);
         self.bookmarks.save_if_dirty();
         self.history.save_if_dirty();
         self.refresh_bookmarks();
@@ -2434,7 +2537,7 @@ impl App {
             MenuItem::entry(13, "結束"),
         ];
         let scale = self.ui.window().scale_factor();
-        match platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32) {
+        match platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32, true) {
             1 => self.run_shortcut(Shortcut::NewTab),
             2 => self.run_shortcut(Shortcut::NewPrivateTab),
             3 => self.run_shortcut(Shortcut::ShowHistory),

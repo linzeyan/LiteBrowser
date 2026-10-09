@@ -31,6 +31,24 @@ pub struct Bookmark {
     pub url: String,
     #[serde(default)]
     pub added: u64,
+    /// Folder path like "工作/專案"; "" = directly on the bookmarks bar. A folder exists while
+    /// it holds a bookmark, so there is nothing else to store for it.
+    #[serde(default)]
+    pub folder: String,
+}
+
+/// What a folder shows, in bookmark order: its own bookmarks, and each subfolder once, where its
+/// first bookmark is.
+#[derive(Debug, PartialEq)]
+pub enum FolderEntry {
+    Bookmark(usize),
+    /// Full path and display name.
+    Folder(String, String),
+}
+
+/// "a / b/" → "a/b".
+fn normalize_folder(folder: &str) -> String {
+    folder.split('/').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")
 }
 
 pub struct Bookmarks {
@@ -52,21 +70,37 @@ impl Bookmarks {
         self.items.iter().any(|b| b.url == url)
     }
 
-    /// Adds or removes `url`; returns whether it is bookmarked afterwards.
+    /// Adds or removes `url` on the bookmarks bar; returns whether it is bookmarked afterwards.
     pub fn toggle(&mut self, url: &str, title: &str) -> bool {
-        self.dirty = true;
         if let Some(pos) = self.items.iter().position(|b| b.url == url) {
             self.items.remove(pos);
+            self.dirty = true;
             false
         } else {
-            let title = if title.trim().is_empty() { url } else { title };
-            self.items.push(Bookmark { title: title.to_string(), url: url.to_string(), added: now_secs() });
+            self.add(url, title, "");
             true
         }
     }
 
+    pub fn add(&mut self, url: &str, title: &str, folder: &str) {
+        let title = if title.trim().is_empty() { url } else { title };
+        let folder = normalize_folder(folder);
+        self.items.push(Bookmark { title: title.to_string(), url: url.to_string(), added: now_secs(), folder });
+        self.dirty = true;
+    }
+
+    /// For a re-import: a bookmark still loose on the bar moves into the folder it has in the
+    /// source browser (earlier versions imported everything flat onto the bar).
+    pub fn file_if_loose(&mut self, url: &str, folder: &str) {
+        let folder = normalize_folder(folder);
+        if let Some(b) = self.items.iter_mut().find(|b| b.url == url && b.folder.is_empty() && !folder.is_empty()) {
+            b.folder = folder;
+            self.dirty = true;
+        }
+    }
+
     /// Edits a bookmark in place. An empty title falls back to the URL.
-    pub fn update(&mut self, index: usize, title: &str, url: &str) {
+    pub fn update(&mut self, index: usize, title: &str, url: &str, folder: &str) {
         let url = url.trim();
         if url.is_empty() {
             return;
@@ -75,8 +109,26 @@ impl Bookmarks {
             let title = title.trim();
             b.title = if title.is_empty() { url.to_string() } else { title.to_string() };
             b.url = url.to_string();
+            b.folder = normalize_folder(folder);
             self.dirty = true;
         }
+    }
+
+    pub fn folder_entries(&self, folder: &str) -> Vec<FolderEntry> {
+        let mut out = Vec::new();
+        for (i, b) in self.items.iter().enumerate() {
+            if b.folder == folder {
+                out.push(FolderEntry::Bookmark(i));
+                continue;
+            }
+            let rest = if folder.is_empty() { Some(b.folder.as_str()) } else { b.folder.strip_prefix(folder).and_then(|r| r.strip_prefix('/')) };
+            let Some(name) = rest.and_then(|r| r.split('/').next()) else { continue };
+            let path = if folder.is_empty() { name.to_string() } else { format!("{folder}/{name}") };
+            if !out.iter().any(|e| matches!(e, FolderEntry::Folder(p, _) if *p == path)) {
+                out.push(FolderEntry::Folder(path, name.to_string()));
+            }
+        }
+        out
     }
 
     pub fn remove(&mut self, index: usize) {
@@ -331,16 +383,42 @@ mod tests {
         let path = dir.join("b.json");
         let mut b = Bookmarks::load(&path);
         b.toggle("https://a.com", "A");
-        b.update(0, "  Renamed  ", " https://b.com ");
+        b.update(0, "  Renamed  ", " https://b.com ", " 工作 / 專案/ ");
         assert_eq!(b.items()[0].title, "Renamed");
         assert_eq!(b.items()[0].url, "https://b.com");
+        assert_eq!(b.items()[0].folder, "工作/專案");
         // An empty title falls back to the URL; an empty URL is rejected.
-        b.update(0, "", "https://c.com");
+        b.update(0, "", "https://c.com", "");
         assert_eq!(b.items()[0].title, "https://c.com");
-        b.update(0, "keep", "   ");
+        assert_eq!(b.items()[0].folder, "", "an empty folder puts it back on the bar");
+        b.update(0, "keep", "   ", "");
         assert_eq!(b.items()[0].url, "https://c.com");
-        b.update(9, "x", "https://x.com"); // out of range is a no-op
+        b.update(9, "x", "https://x.com", ""); // out of range is a no-op
         assert_eq!(b.items().len(), 1);
+    }
+
+    #[test]
+    fn folders_show_where_their_first_bookmark_is() {
+        let dir = temp_dir("bm-folders");
+        let mut b = Bookmarks::load(&dir.join("b.json"));
+        b.add("https://a.com", "A", "");
+        b.add("https://w1.com", "W1", "工作");
+        b.add("https://b.com", "B", "");
+        b.add("https://p.com", "P", "工作/專案");
+        b.add("https://w2.com", "W2", "工作");
+        b.add("https://x.com", "X", "工作區"); // a sibling whose name starts like 工作
+        use FolderEntry::*;
+        assert_eq!(
+            b.folder_entries(""),
+            vec![Bookmark(0), Folder("工作".into(), "工作".into()), Bookmark(2), Folder("工作區".into(), "工作區".into())]
+        );
+        assert_eq!(b.folder_entries("工作"), vec![Bookmark(1), Folder("工作/專案".into(), "專案".into()), Bookmark(4)]);
+
+        // Re-importing files a loose bar bookmark into its source folder, and leaves filed ones alone.
+        b.file_if_loose("https://a.com", "其他書籤");
+        b.file_if_loose("https://w1.com", "其他書籤");
+        assert_eq!(b.items()[0].folder, "其他書籤");
+        assert_eq!(b.items()[1].folder, "工作");
     }
 
     #[test]

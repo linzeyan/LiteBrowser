@@ -143,8 +143,12 @@ pub fn frontend_url(port: u16, target: &Target) -> Option<String> {
 }
 
 /// The browser switches that enable the remote-debugging server.
+///
+/// The port alone marks the browser as automation-controlled (`navigator.webdriver` is true), and
+/// Cloudflare's challenge then never passes (claude.ai stuck on "請稍候…"; the same page in Edge
+/// on the same machine went straight through). Turning that blink feature off keeps the server.
 pub fn browser_switches() -> &'static str {
-    "--remote-debugging-port=0 --remote-allow-origins=*"
+    "--remote-debugging-port=0 --remote-allow-origins=* --disable-blink-features=AutomationControlled"
 }
 
 #[cfg(test)]
