@@ -6,16 +6,19 @@ use std::path::PathBuf;
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{CloseHandle, ERROR_ALREADY_EXISTS, HANDLE, HWND, LPARAM, POINT, WPARAM};
-use windows::Win32::Graphics::Gdi::ClientToScreen;
+use windows::Win32::Graphics::Gdi::{
+    ClientToScreen, CreateDIBSection, DeleteObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
+};
 use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_BLOB};
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, SendMessageW, SetForegroundWindow,
-    TrackPopupMenuEx, HMENU, MF_CHECKED, MF_DISABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WM_COPYDATA,
+    AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetMenuItemCount, SendMessageW,
+    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+    MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON,
+    TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WM_COPYDATA,
 };
 
 /// A hidden window class/title used to find a running instance. Also the WM_COPYDATA tag.
@@ -121,19 +124,32 @@ fn send_to_existing(url: Option<&str>) {
 // ---------------------------------------------------------------------------------------------
 // Native popup menu
 
+/// A menu item's icon: `size`×`size` premultiplied RGBA, already at the menu's pixel size.
+#[derive(Clone, Debug)]
+pub struct MenuIcon {
+    pub size: u32,
+    pub rgba: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub enum MenuItem {
-    Entry { id: u32, label: String, checked: bool, enabled: bool },
+    Entry { id: u32, label: String, checked: bool, enabled: bool, icon: Option<MenuIcon> },
     Separator,
-    Submenu { label: String, items: Vec<MenuItem> },
+    Submenu { label: String, items: Vec<MenuItem>, icon: Option<MenuIcon> },
 }
 
 impl MenuItem {
     pub fn entry(id: u32, label: impl Into<String>) -> Self {
-        MenuItem::Entry { id, label: label.into(), checked: false, enabled: true }
+        MenuItem::Entry { id, label: label.into(), checked: false, enabled: true, icon: None }
     }
     pub fn disabled(label: impl Into<String>) -> Self {
-        MenuItem::Entry { id: 0, label: label.into(), checked: false, enabled: false }
+        MenuItem::Entry { id: 0, label: label.into(), checked: false, enabled: false, icon: None }
+    }
+    pub fn with_icon(mut self, new: Option<MenuIcon>) -> Self {
+        if let MenuItem::Entry { icon, .. } | MenuItem::Submenu { icon, .. } = &mut self {
+            *icon = new;
+        }
+        self
     }
 }
 
@@ -169,12 +185,17 @@ fn track_menu(items: &[MenuItem], pt: POINT, flags: TRACK_POPUP_MENU_FLAGS) -> u
     let Some(owner) = owner else { return 0 };
     unsafe {
         let Ok(menu) = CreatePopupMenu() else { return 0 };
+        // A menu does not own its items' bitmaps; they are freed once it is gone.
+        let mut bitmaps = Vec::new();
         for item in items {
-            append(menu, item);
+            append(menu, item, &mut bitmaps);
         }
         let _ = SetForegroundWindow(owner);
         let chosen = TrackPopupMenuEx(menu, flags.0, pt.x, pt.y, owner, None);
         let _ = DestroyMenu(menu);
+        for bitmap in bitmaps {
+            let _ = DeleteObject(bitmap.into());
+        }
         chosen.0 as u32
     }
 }
@@ -294,12 +315,12 @@ pub fn destroy_singleton_window() {
     }
 }
 
-unsafe fn append(menu: HMENU, item: &MenuItem) {
+unsafe fn append(menu: HMENU, item: &MenuItem, bitmaps: &mut Vec<HBITMAP>) {
     match item {
         MenuItem::Separator => {
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         }
-        MenuItem::Entry { id, label, checked, enabled } => {
+        MenuItem::Entry { id, label, checked, enabled, icon } => {
             let mut flags = MF_STRING;
             if *checked {
                 flags |= MF_CHECKED;
@@ -309,15 +330,61 @@ unsafe fn append(menu: HMENU, item: &MenuItem) {
             }
             let text = HSTRING::from(label.as_str());
             let _ = AppendMenuW(menu, flags, *id as usize, &text);
+            set_last_icon(menu, icon.as_ref(), bitmaps);
         }
-        MenuItem::Submenu { label, items } => {
+        MenuItem::Submenu { label, items, icon } => {
             // Destroying the parent menu destroys attached submenus too.
             let Ok(sub) = CreatePopupMenu() else { return };
             for item in items {
-                append(sub, item);
+                append(sub, item, bitmaps);
             }
             let text = HSTRING::from(label.as_str());
             let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &text);
+            set_last_icon(menu, icon.as_ref(), bitmaps);
         }
     }
+}
+
+unsafe fn set_last_icon(menu: HMENU, icon: Option<&MenuIcon>, bitmaps: &mut Vec<HBITMAP>) {
+    let Some(icon) = icon else { return };
+    let Some(bitmap) = icon_bitmap(icon) else { return };
+    let info = MENUITEMINFOW {
+        cbSize: std::mem::size_of::<MENUITEMINFOW>() as u32,
+        fMask: MIIM_BITMAP,
+        hbmpItem: bitmap,
+        ..Default::default()
+    };
+    let last = GetMenuItemCount(Some(menu)) - 1;
+    let _ = SetMenuItemInfoW(menu, last as u32, true, &info);
+    bitmaps.push(bitmap);
+}
+
+/// A 32-bit top-down DIB: menus draw such a bitmap with its alpha, which they take premultiplied.
+unsafe fn icon_bitmap(icon: &MenuIcon) -> Option<HBITMAP> {
+    if icon.size == 0 || icon.rgba.len() != (icon.size * icon.size * 4) as usize {
+        return None;
+    }
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: icon.size as i32,
+            biHeight: -(icon.size as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let mut bits = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap.into());
+        return None;
+    }
+    let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, icon.rgba.len());
+    for (bgra, rgba) in pixels.chunks_exact_mut(4).zip(icon.rgba.chunks_exact(4)) {
+        bgra.copy_from_slice(&[rgba[2], rgba[1], rgba[0], rgba[3]]);
+    }
+    Some(bitmap)
 }

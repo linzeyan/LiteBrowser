@@ -46,6 +46,10 @@ pub enum FolderEntry {
     Folder(String, String),
 }
 
+/// Where imports file what lived outside the source browser's bar. Like Chrome's "Other
+/// bookmarks", the bookmarks bar keeps it at its right end.
+pub const OTHER_FOLDER: &str = "其他書籤";
+
 /// "a / b/" → "a/b".
 fn normalize_folder(folder: &str) -> String {
     folder.split('/').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/")

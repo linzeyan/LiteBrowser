@@ -30,8 +30,11 @@ pub struct Config {
     pub devtools_dock_right: bool,
     /// Check GitHub for a newer release at startup and stage it for the next start.
     pub auto_update: bool,
-    /// Serve an MCP endpoint on localhost so an LLM can drive the browser. Needs a restart.
+    /// Serve an MCP endpoint so an LLM can drive the browser. Needs a restart.
     pub mcp_enabled: bool,
+    /// IP address the MCP endpoint listens on: 127.0.0.1 = this machine only; 0.0.0.0 = every
+    /// network interface, so anyone who can reach this machine and has the URL can drive the browser.
+    pub mcp_host: String,
     /// Port for the MCP endpoint; 0 picks a free one.
     pub mcp_port: u16,
     /// Reopen the tabs from last time (as discarded tabs, so they cost no memory until opened).
@@ -56,6 +59,7 @@ impl Default for Config {
             devtools_dock_right: false,
             auto_update: true,
             mcp_enabled: false,
+            mcp_host: "127.0.0.1".into(),
             mcp_port: 0,
             restore_session: true,
             show_bookmarks_bar: true,
@@ -95,6 +99,10 @@ impl Config {
         if !self.search_url.contains("{}") {
             self.search_url = Config::default().search_url;
         }
+        self.mcp_host = match self.mcp_host.trim().parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.to_string(),
+            Err(_) => Config::default().mcp_host,
+        };
         self
     }
 
@@ -139,6 +147,16 @@ mod tests {
         let cfg = Config { max_live_tabs: 0, search_url: "https://x".into(), ..Config::default() }.sanitized();
         assert_eq!(cfg.max_live_tabs, 1);
         assert!(cfg.search_url.contains("{}"));
+    }
+
+    #[test]
+    fn mcp_host_must_be_an_ip_address() {
+        // Anything that is not an IP falls back to this machine only, never to every interface.
+        let host = |h: &str| Config { mcp_host: h.into(), ..Config::default() }.sanitized().mcp_host;
+        assert_eq!(host(" 0.0.0.0 "), "0.0.0.0");
+        assert_eq!(host("::1"), "::1");
+        assert_eq!(host("example.com"), "127.0.0.1");
+        assert_eq!(host(""), "127.0.0.1");
     }
 
     #[test]

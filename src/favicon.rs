@@ -4,8 +4,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use resvg::tiny_skia::{FilterQuality, IntSize, Pixmap, PixmapPaint, Transform};
 use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
 
+use crate::platform::MenuIcon;
 use crate::url_input;
 
 pub struct FaviconCache {
@@ -104,6 +106,30 @@ pub fn decode_png(bytes: &[u8]) -> Option<Image> {
     Some(Image::from_rgba8(buffer))
 }
 
+/// A site icon redrawn `px` square for a native menu.
+pub fn menu_icon(image: &Image, px: u32) -> Option<MenuIcon> {
+    let src = image.to_rgba8_premultiplied()?;
+    let (w, h) = (src.width(), src.height());
+    let src = Pixmap::from_vec(src.as_bytes().to_vec(), IntSize::from_wh(w, h)?)?;
+    let mut out = Pixmap::new(px, px)?;
+    let scale = px as f32 / w.max(h) as f32;
+    let paint = PixmapPaint { quality: FilterQuality::Bicubic, ..PixmapPaint::default() };
+    out.draw_pixmap(0, 0, src.as_ref(), &paint, Transform::from_scale(scale, scale), None);
+    Some(MenuIcon { size: px, rgba: out.take() })
+}
+
+/// One of the UI's outline glyphs (a path in a 24×24 box, like `Icons` in app.slint) drawn `px`
+/// square for a native menu, with the bookmarks bar's stroke: 1.4 px at 16 px.
+pub fn menu_glyph(path: &str, px: u32) -> Option<MenuIcon> {
+    let svg = format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{px}" height="{px}" viewBox="0 0 24 24"><path d="{path}" fill="none" stroke="#474747" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"/></svg>"##
+    );
+    let tree = resvg::usvg::Tree::from_str(&svg, &resvg::usvg::Options::default()).ok()?;
+    let mut pixmap = Pixmap::new(px, px)?;
+    resvg::render(&tree, Transform::default(), &mut pixmap.as_mut());
+    Some(MenuIcon { size: px, rgba: pixmap.take() })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +165,19 @@ mod tests {
         assert_eq!(cache.get("https://visited.example/").unwrap().size().width, 8);
         assert!(cache.get("https://not-bookmarked.example/").is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn menu_icons_are_drawn_at_the_menu_size() {
+        // The menu bitmap must be exactly px² (platform rejects anything else): a 16 px favicon
+        // on a 175 % screen becomes 28 px, opaque where the icon is.
+        let icon = menu_icon(&decode_png(&png(16)).unwrap(), 28).unwrap();
+        assert_eq!((icon.size, icon.rgba.len()), (28, 28 * 28 * 4));
+        assert_eq!(icon.rgba[(14 * 28 + 14) * 4 + 3], 255);
+        // A glyph is actually inked, not left blank, and stays inside its stroke.
+        let glyph = menu_glyph("M 3.5 12 L 20.5 12", 28).unwrap();
+        assert_eq!(glyph.rgba.len(), 28 * 28 * 4);
+        assert!(glyph.rgba.chunks_exact(4).any(|p| p[3] > 0));
+        assert_eq!(glyph.rgba[3], 0);
     }
 }

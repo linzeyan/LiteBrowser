@@ -57,7 +57,7 @@ pub enum EngineEvent {
     BrowserGone,
     Shortcut(Shortcut),
     SuspendFinished(bool),
-    /// PNG bytes of the page's favicon.
+    /// PNG bytes of the page's favicon; empty when the page has none.
     Favicon(Vec<u8>),
     /// The page entered or left HTML5 full screen (a video player, a slide deck).
     FullScreen(bool),
@@ -374,6 +374,15 @@ impl WebView {
                 let wv15_for_fetch = wv15.clone();
                 wv15.add_FaviconChanged(
                     &FaviconChangedEventHandler::create(Box::new(move |_, _| {
+                        // A page without an icon has an empty FaviconUri; GetFavicon would still
+                        // hand back WebView2's generic globe, which would then be cached as the
+                        // site's icon and shadow one imported from another browser.
+                        let mut uri = PWSTR::null();
+                        wv15_for_fetch.FaviconUri(&mut uri)?;
+                        if take_pwstr(uri).is_empty() {
+                            post_engine(tab, EngineEvent::Favicon(Vec::new()));
+                            return Ok(());
+                        }
                         let handler = GetFaviconCompletedHandler::create(Box::new(move |result, stream| {
                             if result.is_ok() {
                                 if let Some(stream) = stream {

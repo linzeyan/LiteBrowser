@@ -1,13 +1,14 @@
 //! An MCP server so an LLM can drive the browser.
 //!
-//! Speaks JSON-RPC 2.0 over HTTP POST on localhost only. The request path carries a token
-//! generated at startup, so another local program cannot drive the browser by guessing the port.
+//! Speaks JSON-RPC 2.0 over HTTP POST, on localhost unless the user picks another address. The
+//! request path carries a token generated at startup, so another program cannot drive the browser
+//! by guessing the port.
 //!
 //! The HTTP side lives on its own thread; every tool call is handed to the UI thread through
 //! `dispatch`, because WebView2 may only be touched there.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{Ipv4Addr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -35,11 +36,11 @@ pub type Dispatcher = Arc<dyn Fn(Call) -> Result<Value, String> + Send + Sync>;
 pub const SERVER_NAME: &str = "litebrowser";
 const DEFAULT_PROTOCOL: &str = "2025-06-18";
 
-/// Starts the server on `port` (0 picks a free one) and returns the port it actually bound.
+/// Starts the server on `addr` (port 0 picks a free one) and returns the address it actually bound.
 /// The listener thread runs until the process exits.
-pub fn serve(port: u16, token: String, dispatch: Dispatcher) -> std::io::Result<u16> {
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))?;
-    let bound = listener.local_addr()?.port();
+pub fn serve(addr: SocketAddr, token: String, dispatch: Dispatcher) -> std::io::Result<SocketAddr> {
+    let listener = TcpListener::bind(addr)?;
+    let bound = listener.local_addr()?;
     std::thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let token = token.clone();
@@ -310,7 +311,7 @@ pub fn tool_definitions() -> Vec<Value> {
 pub fn generate_token() -> String {
     let mut bytes = [0u8; 16];
     if getrandom::getrandom(&mut bytes).is_err() {
-        // Still unique per run, just less random; the port is localhost-only either way.
+        // Still unique per run, just less random.
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
@@ -323,6 +324,7 @@ pub fn generate_token() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
     use std::sync::Mutex;
 
     /// Records the calls it receives and answers with a canned value.
@@ -446,10 +448,10 @@ mod tests {
     fn the_endpoint_requires_the_token_and_answers_json_rpc() {
         let (dispatch, _) = recorder();
         let token = generate_token();
-        let port = serve(0, token.clone(), dispatch).unwrap();
+        let addr = serve((Ipv4Addr::LOCALHOST, 0).into(), token.clone(), dispatch).unwrap();
 
         let post = |path: &str, body: &str| -> String {
-            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+            let mut stream = TcpStream::connect(addr).unwrap();
             let request = format!(
                 "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{body}",
                 body.len()

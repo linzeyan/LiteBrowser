@@ -122,7 +122,7 @@ fn folder_path(folders: &HashMap<i64, (i64, String, String)>, mut id: i64) -> St
                 break;
             }
             "unfiled_____" => {
-                names.push("其他書籤".to_string());
+                names.push(crate::storage::OTHER_FOLDER.to_string());
                 break;
             }
             "mobile______" => {

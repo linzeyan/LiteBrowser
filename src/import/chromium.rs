@@ -86,7 +86,7 @@ pub fn read_bookmarks(path: &Path) -> Result<Vec<ImportedBookmark>, String> {
         for (root_key, node) in roots {
             let top = match root_key.as_str() {
                 "bookmark_bar" => String::new(),
-                "other" => "其他書籤".to_string(),
+                "other" => crate::storage::OTHER_FOLDER.to_string(),
                 "synced" => "行動裝置書籤".to_string(),
                 _ => continue,
             };

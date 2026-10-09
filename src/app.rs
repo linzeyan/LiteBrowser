@@ -24,7 +24,9 @@ use crate::memory;
 use crate::paths::Paths;
 use crate::platform::{self, MenuItem};
 use crate::shortcuts::{self, Shortcut};
-use crate::storage::{self, Bookmarks, FolderEntry, History, Session, SessionTab, SuggestionKind, WindowState};
+use crate::storage::{
+    self, Bookmarks, FolderEntry, History, Session, SessionTab, SuggestionKind, WindowState, OTHER_FOLDER,
+};
 use crate::tabs::{self, Action, MemoryState, Policy, Residency, TabId, TabSnapshot};
 use crate::url_input;
 use crate::webview::{self, EngineEvent, ExtensionChange, ExtensionInfo, NewWindowRequest, WebView};
@@ -75,6 +77,9 @@ pub enum UiEvent {
     BookmarkMenu(usize),
     /// A bookmarks-bar folder: its path and the chip's bottom-left corner, logical pixels.
     BookmarkFolderMenu(String, f32, f32),
+    /// The bookmarks bar's » button: the first chip that did not fit, and the button's
+    /// bottom-right corner, logical pixels.
+    BookmarkOverflowMenu(usize, f32, f32),
     HistorySearch(String),
     RemoveHistory(String),
     ClearHistory,
@@ -257,18 +262,27 @@ fn start_update_check() {
 
 /// Starts the MCP endpoint when it is enabled, and records the URL an LLM client should use.
 fn start_mcp_server() {
-    let (enabled, port, paths) = APP.with(|cell| {
+    let (enabled, host, port, paths) = APP.with(|cell| {
         let app = cell.borrow();
         let app = app.as_ref().expect("app exists before the event loop runs");
-        (app.cfg.mcp_enabled, app.cfg.mcp_port, app.paths.clone())
+        (app.cfg.mcp_enabled, app.cfg.mcp_host.clone(), app.cfg.mcp_port, app.paths.clone())
     });
     if !enabled {
         return;
     }
+    // Config::sanitized only lets IP addresses through.
+    let host: std::net::IpAddr = host.parse().unwrap_or(std::net::Ipv4Addr::LOCALHOST.into());
     let token = mcp::generate_token();
-    match mcp::serve(port, token.clone(), std::sync::Arc::new(mcp_dispatch)) {
-        Ok(bound) => {
-            let url = format!("http://127.0.0.1:{bound}/mcp/{token}");
+    match mcp::serve((host, port).into(), token.clone(), std::sync::Arc::new(mcp_dispatch)) {
+        Ok(mut bound) => {
+            // 0.0.0.0 cannot be dialed; a client on this machine reaches it through loopback.
+            if bound.ip().is_unspecified() {
+                bound.set_ip(match bound.ip() {
+                    std::net::IpAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                    std::net::IpAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+                });
+            }
+            let url = format!("http://{bound}/mcp/{token}");
             log!("MCP endpoint listening on {url}");
             // The token is new on every run, so write the current URL out for client config.
             let _ = crate::paths::write_atomic(&paths.mcp_url(), url.as_bytes());
@@ -313,6 +327,38 @@ fn apply_pending_password_imports(paths: &Paths) {
     }
 }
 
+// Icons.folder and Icons.globe in app.slint, for native menus.
+const FOLDER_GLYPH: &str = "M 3.5 6.5 A 1.5 1.5 0 0 1 5 5 L 9.5 5 L 11.5 7 L 19 7 A 1.5 1.5 0 0 1 20.5 8.5 L 20.5 17.5 A 1.5 1.5 0 0 1 19 19 L 5 19 A 1.5 1.5 0 0 1 3.5 17.5 Z";
+const GLOBE_GLYPH: &str = "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 3.5 12 L 20.5 12 M 12 3.5 A 5 8.5 0 0 0 12 20.5 A 5 8.5 0 0 0 12 3.5";
+
+/// What a bookmark menu's icons are drawn with, at the menu's pixel size.
+struct MenuIcons<'a> {
+    favicons: &'a mut FaviconCache,
+    px: u32,
+    folder: Option<platform::MenuIcon>,
+    globe: Option<platform::MenuIcon>,
+}
+
+/// Menu items for bookmark-folder entries, subfolders as submenus, each with its icon like on the
+/// bookmarks bar. Item ids are bookmark index + 1.
+fn bookmark_menu_items(bookmarks: &Bookmarks, icons: &mut MenuIcons, entries: Vec<FolderEntry>) -> Vec<MenuItem> {
+    entries
+        .into_iter()
+        .map(|entry| match entry {
+            FolderEntry::Bookmark(i) => {
+                let b = &bookmarks.items()[i];
+                let icon = icons.favicons.get(&b.url).and_then(|img| favicon::menu_icon(&img, icons.px));
+                MenuItem::entry(i as u32 + 1, b.title.replace('&', "&&")).with_icon(icon.or_else(|| icons.globe.clone()))
+            }
+            FolderEntry::Folder(sub, name) => MenuItem::Submenu {
+                label: name.replace('&', "&&"),
+                items: bookmark_menu_items(bookmarks, icons, bookmarks.folder_entries(&sub)),
+                icon: icons.folder.clone(),
+            },
+        })
+        .collect()
+}
+
 fn wire_callbacks(ui: &AppWindow) {
     fn ui_post(event: UiEvent) {
         post(Event::Ui(event));
@@ -344,6 +390,7 @@ fn wire_callbacks(ui: &AppWindow) {
     });
     ui.on_bookmark_menu(|i| ui_post(UiEvent::BookmarkMenu(i.max(0) as usize)));
     ui.on_bookmark_folder_menu(|path, x, y| ui_post(UiEvent::BookmarkFolderMenu(path.into(), x, y)));
+    ui.on_bookmark_overflow_menu(|first, x, y| ui_post(UiEvent::BookmarkOverflowMenu(first.max(0) as usize, x, y)));
     ui.on_history_search(|q| ui_post(UiEvent::HistorySearch(q.into())));
     ui.on_remove_history(|url| ui_post(UiEvent::RemoveHistory(url.into())));
     ui.on_clear_history(|| ui_post(UiEvent::ClearHistory));
@@ -831,6 +878,7 @@ impl App {
             }
             UiEvent::BookmarkMenu(i) => self.bookmark_menu(i),
             UiEvent::BookmarkFolderMenu(path, x, y) => self.bookmark_folder_menu(&path, x, y),
+            UiEvent::BookmarkOverflowMenu(first, x, y) => self.bookmark_overflow_menu(first, x, y),
             UiEvent::HistorySearch(q) => {
                 self.history_query = q;
                 self.refresh_history();
@@ -1448,6 +1496,12 @@ impl App {
                 }
             }
             EngineEvent::Favicon(bytes) => {
+                // The new page has no icon: drop the previous page's from the tab, cache nothing.
+                if bytes.is_empty() {
+                    self.tabs[idx].favicon = Image::default();
+                    self.refresh_tabs();
+                    return;
+                }
                 let url = self.tabs[idx].url.clone();
                 // The disk cache would record a private visit, so a private tab's icon lives
                 // only on that tab.
@@ -1617,6 +1671,8 @@ impl App {
             search_url: self.cfg.search_url.clone().into(),
             devtools_dock_right: self.cfg.devtools_dock_right,
             mcp_enabled: self.cfg.mcp_enabled,
+            mcp_host: self.cfg.mcp_host.clone().into(),
+            mcp_port: self.cfg.mcp_port as i32,
         }
     }
 
@@ -1634,6 +1690,8 @@ impl App {
             search_url: s.search_url.to_string(),
             devtools_dock_right: s.devtools_dock_right,
             mcp_enabled: s.mcp_enabled,
+            mcp_host: s.mcp_host.to_string(),
+            mcp_port: s.mcp_port.clamp(0, u16::MAX as i32) as u16,
             ..old.clone()
         }
         .sanitized();
@@ -1643,7 +1701,9 @@ impl App {
         self.layout_views();
         let needs_restart = old.disable_gpu != self.cfg.disable_gpu
             || old.adblock != self.cfg.adblock
-            || old.mcp_enabled != self.cfg.mcp_enabled;
+            || old.mcp_enabled != self.cfg.mcp_enabled
+            || old.mcp_host != self.cfg.mcp_host
+            || old.mcp_port != self.cfg.mcp_port;
         self.set_status(match (saved.is_ok(), needs_restart) {
             (false, _) => "設定無法寫入檔案",
             (true, true) => "設定已儲存；GPU／廣告封鎖／MCP 的變更在重新啟動後生效",
@@ -1945,8 +2005,7 @@ impl App {
             })
             .collect();
         let bar: Vec<BarItemData> = self
-            .bookmarks
-            .folder_entries("")
+            .bar_entries()
             .into_iter()
             .map(|entry| match entry {
                 FolderEntry::Bookmark(i) => BarItemData {
@@ -1963,6 +2022,16 @@ impl App {
             .collect();
         self.models.bookmarks.set_vec(items);
         self.models.bar.set_vec(bar);
+        let other = self.bookmarks.folder_entries("").iter().any(|e| matches!(e, FolderEntry::Folder(p, _) if p == OTHER_FOLDER));
+        self.ui.set_other_folder(if other { OTHER_FOLDER.into() } else { SharedString::new() });
+    }
+
+    /// The bookmarks bar's chips in order: the top level, minus 其他書籤, which has its own place
+    /// at the bar's right end.
+    fn bar_entries(&self) -> Vec<FolderEntry> {
+        let mut entries = self.bookmarks.folder_entries("");
+        entries.retain(|e| !matches!(e, FolderEntry::Folder(path, _) if path == OTHER_FOLDER));
+        entries
     }
 
     fn refresh_history(&mut self) {
@@ -2088,23 +2157,31 @@ impl App {
     }
 
     /// A bookmarks-bar folder drops down as a native menu (a Slint one would sink under the
-    /// WebView), its subfolders as submenus. Item ids are bookmark index + 1.
+    /// WebView), its subfolders as submenus.
     fn bookmark_folder_menu(&mut self, path: &str, x: f32, y: f32) {
-        fn build(bookmarks: &Bookmarks, path: &str) -> Vec<MenuItem> {
-            bookmarks
-                .folder_entries(path)
-                .into_iter()
-                .map(|entry| match entry {
-                    FolderEntry::Bookmark(i) => MenuItem::entry(i as u32 + 1, bookmarks.items()[i].title.replace('&', "&&")),
-                    FolderEntry::Folder(sub, name) => {
-                        MenuItem::Submenu { label: name.replace('&', "&&"), items: build(bookmarks, &sub) }
-                    }
-                })
-                .collect()
-        }
-        let menu = build(&self.bookmarks, path);
+        let entries = self.bookmarks.folder_entries(path);
+        self.open_bookmark_menu(entries, x, y, false);
+    }
+
+    /// The » button lists the bar's chips from the first one that did not fit.
+    fn bookmark_overflow_menu(&mut self, first: usize, x: f32, y: f32) {
+        let entries = self.bar_entries().into_iter().skip(first).collect();
+        self.open_bookmark_menu(entries, x, y, true);
+    }
+
+    /// Shows a menu of bookmark entries hanging from (x, y), logical pixels, and opens the pick.
+    fn open_bookmark_menu(&mut self, entries: Vec<FolderEntry>, x: f32, y: f32, right_aligned: bool) {
         let scale = self.ui.window().scale_factor();
-        let chosen = platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32, false);
+        // Menu icons are small icons: 16 px at 100 %.
+        let px = (16.0 * scale).round() as u32;
+        let mut icons = MenuIcons {
+            favicons: &mut self.favicons,
+            px,
+            folder: favicon::menu_glyph(FOLDER_GLYPH, px),
+            globe: favicon::menu_glyph(GLOBE_GLYPH, px),
+        };
+        let menu = bookmark_menu_items(&self.bookmarks, &mut icons, entries);
+        let chosen = platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32, right_aligned);
         if let Some(b) = (chosen as usize).checked_sub(1).and_then(|i| self.bookmarks.items().get(i)) {
             let url = b.url.clone();
             self.open_url(url);
@@ -2520,7 +2597,7 @@ impl App {
             MenuItem::entry(3, "歷史紀錄\tCtrl+H"),
             MenuItem::entry(4, "下載\tCtrl+J"),
             MenuItem::entry(5, "書籤\tCtrl+Shift+O"),
-            MenuItem::Entry { id: 6, label: "顯示書籤列".into(), checked: bar, enabled: true },
+            MenuItem::Entry { id: 6, label: "顯示書籤列".into(), checked: bar, enabled: true, icon: None },
             if self.closed.is_empty() {
                 MenuItem::disabled("重新開啟關閉的分頁\tCtrl+Shift+T")
             } else {

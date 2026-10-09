@@ -31,6 +31,8 @@ raw-window-handle = "0.6"
 webview2-com = "0.39"
 windows-core = "0.62"
 png = "0.17"
+# Slint already builds this version with these features; it draws the native menus' icons.
+resvg = { version = "0.48", default-features = false }
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
