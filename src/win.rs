@@ -11,8 +11,8 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecute
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsChild, IsWindowVisible, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOVE, WM_MOVING,
-    WM_RBUTTONDOWN, WM_SETICON, WM_SIZE, WS_CLIPCHILDREN,
+    SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_LBUTTONDOWN, WM_MOVE, WM_MOVING, WM_SETICON,
+    WM_SIZE, WS_CLIPCHILDREN,
 };
 
 thread_local! {
@@ -105,8 +105,11 @@ unsafe extern "system" fn subclass_proc(
             }
         }
         // A click on the Slint UI while the page has keyboard focus: take the focus back,
-        // otherwise typing into the address bar would go to the web page.
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => unsafe {
+        // otherwise typing into the address bar would go to the web page. Only a left click: the
+        // focus would land in the address bar, so a tab's or bookmark's menu (right) or closing
+        // a tab (middle) would leave the page unable to type into. Like Chrome, those keep the
+        // focus where it is; the address bar's own menu takes it itself.
+        WM_LBUTTONDOWN => unsafe {
             PAGE_FOCUS.set(HWND::default());
             if GetFocus() != hwnd {
                 let _ = SetFocus(Some(hwnd));

@@ -2771,6 +2771,11 @@ impl App {
             MenuItem::Separator,
             MenuItem::entry(5, "全選"),
         ];
+        // A right click no longer takes the focus from the page (win.rs), and pasting into the
+        // bar must leave the keyboard there.
+        if let Some(hwnd) = self.hwnd {
+            win::focus_main_window(hwnd);
+        }
         let action = match platform::popup_menu(&menu) {
             1 => "undo",
             2 => "cut",
