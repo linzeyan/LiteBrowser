@@ -1,6 +1,7 @@
 //! Bookmarks, history and the saved session, stored as small JSON files.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -257,6 +258,8 @@ pub enum SuggestionKind {
     History,
     Search,
     Url,
+    /// An open tab: picking it switches there instead of loading the page a second time.
+    Tab(crate::tabs::TabId),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -267,8 +270,10 @@ pub struct Suggestion {
     pub url: String,
 }
 
+/// `tabs` are the open tabs the user may switch to: id, title, URL.
 pub fn suggestions(
     query: &str,
+    tabs: &[(crate::tabs::TabId, &str, &str)],
     bookmarks: &Bookmarks,
     history: &History,
     search_url: &str,
@@ -286,6 +291,17 @@ pub fn suggestions(
         return out;
     }
     let words = query_words(query);
+    // An open tab goes ahead of bookmarks and history, which then skip its URL: a second copy of
+    // a page costs a second renderer.
+    for &(id, title, url) in tabs.iter().filter(|(_, title, url)| matches_words(&words, title, url)) {
+        if out.len() > limit / 2 {
+            break;
+        }
+        if !out.iter().any(|s| matches!(s.kind, SuggestionKind::Tab(_)) && s.url == url) {
+            let title = if title.is_empty() { url } else { title };
+            out.push(Suggestion { kind: SuggestionKind::Tab(id), title: title.to_string(), url: url.to_string() });
+        }
+    }
     for b in bookmarks.items().iter().filter(|b| matches_words(&words, &b.title, &b.url)) {
         if out.len() > limit / 2 {
             break;
@@ -306,6 +322,43 @@ pub fn suggestions(
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// Page zoom
+
+/// Page zoom per host, as Chrome keeps it: a site comes back at the zoom it was left at, in
+/// every tab and after a discarded tab reloads.
+pub struct ZoomLevels {
+    levels: BTreeMap<String, f64>,
+    path: PathBuf,
+    dirty: bool,
+}
+
+impl ZoomLevels {
+    pub fn load(path: &Path) -> Self {
+        Self { levels: load_json(path), path: path.to_path_buf(), dirty: false }
+    }
+
+    pub fn get(&self, host: &str) -> f64 {
+        self.levels.get(host).copied().unwrap_or(1.0)
+    }
+
+    /// 100 % is what every site gets anyway, so it is dropped rather than stored.
+    pub fn set(&mut self, host: &str, factor: f64) {
+        let changed = if (factor - 1.0).abs() < 0.001 {
+            self.levels.remove(host).is_some()
+        } else {
+            self.levels.insert(host.to_string(), factor) != Some(factor)
+        };
+        self.dirty |= changed;
+    }
+
+    pub fn save_if_dirty(&mut self) {
+        if self.dirty && save_json(&self.path, &self.levels).is_ok() {
+            self.dirty = false;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -460,13 +513,52 @@ mod tests {
         let mut h = History::load(&dir.join("h.json"));
         h.record("https://app.clickup.com", "ClickUp", 1);
         h.record("https://clickup.com/blog", "Blog", 2);
-        let s = suggestions("clickup", &bm, &h, "https://s/?q={}", 6);
+        let s = suggestions("clickup", &[], &bm, &h, "https://s/?q={}", 6);
         assert_eq!(s[0].kind, SuggestionKind::Search);
         assert_eq!(s[1].url, "https://app.clickup.com");
         assert_eq!(s.len(), 3, "bookmark and history duplicates are merged");
-        let s = suggestions("github.com", &bm, &h, "https://s/?q={}", 6);
+        let s = suggestions("github.com", &[], &bm, &h, "https://s/?q={}", 6);
         assert_eq!(s[0].kind, SuggestionKind::Url);
         assert_eq!(s[0].url, "https://github.com");
+    }
+
+    #[test]
+    fn open_tabs_are_offered_instead_of_loading_the_page_again() {
+        let dir = temp_dir("sugg-tabs");
+        let mut bm = Bookmarks::load(&dir.join("b.json"));
+        bm.toggle("https://app.clickup.com", "ClickUp");
+        let mut h = History::load(&dir.join("h.json"));
+        h.record("https://app.clickup.com", "ClickUp", 1);
+        h.record("https://clickup.com/pricing", "Pricing", 2);
+        let tabs = [
+            (7, "ClickUp", "https://app.clickup.com"),
+            (8, "Inbox", "https://mail.example.com"),
+            (9, "", "https://clickup.com/blog"),
+            (10, "ClickUp copy", "https://app.clickup.com"),
+        ];
+        let s = suggestions("clickup", &tabs, &bm, &h, "https://s/?q={}", 8);
+        let kinds: Vec<_> = s.iter().map(|s| s.kind.clone()).collect();
+        assert_eq!(kinds[..3], [SuggestionKind::Search, SuggestionKind::Tab(7), SuggestionKind::Tab(9)]);
+        assert_eq!(s[2].title, "https://clickup.com/blog", "an untitled tab shows its URL");
+        // Its bookmark and history rows would load the page a second time.
+        assert_eq!(s.iter().filter(|s| s.url == "https://app.clickup.com").count(), 1);
+        assert_eq!(s.last().unwrap().url, "https://clickup.com/pricing");
+    }
+
+    #[test]
+    fn zoom_is_remembered_per_host() {
+        let dir = temp_dir("zoom");
+        let path = dir.join("z.json");
+        let mut z = ZoomLevels::load(&path);
+        assert_eq!(z.get("github.com"), 1.0);
+        z.set("github.com", 1.25);
+        z.set("example.com", 0.9);
+        z.set("example.com", 1.0); // Ctrl+0
+        z.save_if_dirty();
+        let z = ZoomLevels::load(&path);
+        assert_eq!(z.get("github.com"), 1.25);
+        assert_eq!(z.get("example.com"), 1.0);
+        assert!(!std::fs::read_to_string(&path).unwrap().contains("example.com"), "a site back at 100 % is forgotten");
     }
 
     #[test]

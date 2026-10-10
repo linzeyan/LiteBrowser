@@ -40,10 +40,22 @@ pub struct TabSnapshot {
     pub residency: Residency,
     pub active: bool,
     pub pinned: bool,
+    /// The page holds text the user typed and has not sent.
+    pub unsaved: bool,
+    /// Playing sound that is not muted. Not even frozen: freezing stops the sound.
+    pub audible: bool,
     /// Last time (ms) this tab was the active tab.
     pub last_active_ms: u64,
     /// Memory of the renderer processes running this tab; 0 when unknown.
     pub bytes: u64,
+}
+
+impl TabSnapshot {
+    /// Discarding would lose something the user can't get back by reloading — a half-written
+    /// comment, the music — so, as in Chrome, these tabs are only ever frozen.
+    fn keep_loaded(&self) -> bool {
+        self.pinned || self.unsaved || self.audible
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -98,7 +110,7 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
     let in_grace: Vec<TabId> = background
         .iter()
         .rev()
-        .filter(|t| !t.pinned)
+        .filter(|t| !t.keep_loaded())
         .take(GRACE_TABS)
         .filter(|t| idle(t) < policy.grace_ms)
         .map(|t| t.id)
@@ -112,9 +124,9 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
 
     // 1. Timers.
     for t in &background {
-        if !t.pinned && idle(t) >= policy.discard_after_ms {
+        if !t.keep_loaded() && idle(t) >= policy.discard_after_ms {
             discard(t, &mut actions, &mut discarded);
-        } else if t.residency == Residency::Live && idle(t) >= policy.suspend_after_ms {
+        } else if t.residency == Residency::Live && !t.audible && idle(t) >= policy.suspend_after_ms {
             actions.push(Action::Suspend(t.id));
         }
     }
@@ -126,7 +138,7 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
         if excess == 0 {
             break;
         }
-        if t.pinned || discarded.contains(&t.id) {
+        if t.keep_loaded() || discarded.contains(&t.id) {
             continue;
         }
         if !in_grace.contains(&t.id) {
@@ -144,7 +156,7 @@ pub fn plan(tabs: &[TabSnapshot], now_ms: u64, memory: Option<MemoryState>, poli
         let candidate = |respect_grace: bool| {
             background
                 .iter()
-                .filter(|t| !t.pinned && !discarded.contains(&t.id) && !(respect_grace && in_grace.contains(&t.id)))
+                .filter(|t| !t.keep_loaded() && !discarded.contains(&t.id) && !(respect_grace && in_grace.contains(&t.id)))
                 .min_by_key(|t| std::cmp::Reverse(t.bytes))
                 .copied()
         };
@@ -184,7 +196,7 @@ mod tests {
     }
 
     fn tab(id: TabId, residency: Residency, active: bool, last_active_ms: u64) -> TabSnapshot {
-        TabSnapshot { id, residency, active, pinned: false, last_active_ms, bytes: 0 }
+        TabSnapshot { id, residency, active, pinned: false, unsaved: false, audible: false, last_active_ms, bytes: 0 }
     }
 
     fn browser(bytes: u64) -> Option<MemoryState> {
@@ -301,6 +313,21 @@ mod tests {
         pinned.pinned = true;
         let tabs = [tab(1, Live, true, now), pinned, tab(3, Live, false, now - 10 * MIN)];
         assert_eq!(plan(&tabs, now, system_free(MB), &policy()), vec![Action::Suspend(2), Action::Discard(3)]);
+    }
+
+    #[test]
+    fn unsent_input_and_playing_sound_keep_a_tab_loaded() {
+        // A reload would lose the half-written comment and stop the music. Freezing keeps the
+        // comment but would stop the music too, so a playing tab is left running.
+        let now = 100 * MIN;
+        let typing = TabSnapshot { unsaved: true, ..tab(2, Live, false, now - 60 * MIN) };
+        let playing = TabSnapshot { audible: true, bytes: 900 * MB, ..tab(3, Live, false, now - 60 * MIN) };
+        let tabs = [tab(1, Live, true, now), typing, playing, tab(4, Live, false, now - 10 * MIN)];
+        assert_eq!(plan(&tabs, now, system_free(MB), &policy()), vec![Action::Suspend(2), Action::Discard(4)]);
+        assert_eq!(plan(&tabs, now, browser(u64::MAX), &Policy { max_live: 1, ..policy() }), vec![
+            Action::Suspend(2),
+            Action::Discard(4)
+        ]);
     }
 
     #[test]

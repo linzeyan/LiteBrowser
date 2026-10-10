@@ -20,6 +20,9 @@ export struct TabData {
     pinned: bool,
     favicon: image,
     private: bool,
+    // Playing sound (also while muted), and muted by the user.
+    audible: bool,
+    muted: bool,
 }
 
 export struct LinkData {
@@ -48,8 +51,10 @@ export struct ImportProfileData {
 export struct SuggestionData {
     title: string,
     url: string,
-    // "search", "url", "bookmark" or "history"
+    // "search", "url", "bookmark", "history" or "tab"
     kind: string,
+    // The open tab a "tab" suggestion switches to; -1 otherwise.
+    tab-id: int,
 }
 
 export struct ExtensionData {
@@ -130,6 +135,10 @@ global Icons {
     out property <string> edit: "M 4 20 L 8 19 L 19.5 7.5 A 2 2 0 0 0 16.5 4.5 L 5 16 Z M 15 6 L 18 9";
     out property <string> chevrons: "M 6 7 L 11 12 L 6 17 M 13 7 L 18 12 L 13 17";
     out property <string> folder: "M 3.5 6.5 A 1.5 1.5 0 0 1 5 5 L 9.5 5 L 11.5 7 L 19 7 A 1.5 1.5 0 0 1 20.5 8.5 L 20.5 17.5 A 1.5 1.5 0 0 1 19 19 L 5 19 A 1.5 1.5 0 0 1 3.5 17.5 Z";
+    out property <string> speaker: "M 4 9.5 L 7.5 9.5 L 12 5.5 L 12 18.5 L 7.5 14.5 L 4 14.5 Z M 15.5 9.5 A 3.5 3.5 0 0 1 15.5 14.5 M 18 7 A 7 7 0 0 1 18 17";
+    out property <string> speaker-muted: "M 4 9.5 L 7.5 9.5 L 12 5.5 L 12 18.5 L 7.5 14.5 L 4 14.5 Z M 15.5 9.5 L 20.5 14.5 M 20.5 9.5 L 15.5 14.5";
+    // Material's "tab": a window with a raised tab at its top left.
+    out property <string> tab: "M 3.5 5 L 20.5 5 L 20.5 19 L 3.5 19 Z M 11 5 L 11 9 L 20.5 9";
     // Caption glyphs, drawn in a 10x10 box.
     out property <string> private: "M 2 9 L 22 9 M 3 9 A 4.5 4.5 0 0 0 10 15 L 14 15 A 4.5 4.5 0 0 0 21 9 M 7 9 L 9 5 L 15 5 L 17 9";
     out property <string> caption-minimize: "M 0 5 L 10 5";
@@ -253,6 +262,11 @@ component TabItem inherits Rectangle {
     callback clicked;
     callback close;
     callback context-menu;
+    callback toggle-mute;
+
+    property <bool> sound: root.tab.audible || root.tab.muted;
+    // A compact tab has no room beside its icon, so the speaker takes the icon's place, as in Chrome.
+    property <bool> sound-in-icon: root.compact && root.sound && !root.tab.loading;
 
     // A private tab is dark while in the background; once active it joins the toolbar, which
     // turns dark with it (Theme.incognito).
@@ -324,7 +338,19 @@ component TabItem inherits Rectangle {
             if root.tab.loading: Throbber {
                 y: (parent.height - self.height) / 2;
             }
-            if !root.tab.loading && root.tab.private: Path {
+            if root.sound-in-icon: Path {
+                y: (parent.height - self.height) / 2;
+                width: 16px;
+                height: 16px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: root.tab.muted ? Icons.speaker-muted : Icons.speaker;
+                stroke: root.dark ? #d8d8e4 : Theme.icon;
+                stroke-width: 1.5px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            if !root.tab.loading && !root.sound-in-icon && root.tab.private: Path {
                 y: (parent.height - self.height) / 2;
                 width: 16px;
                 height: 16px;
@@ -336,14 +362,14 @@ component TabItem inherits Rectangle {
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
-            if !root.tab.loading && !root.tab.private && root.tab.favicon.width > 0: Image {
+            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.tab.favicon.width > 0: Image {
                 y: (parent.height - self.height) / 2;
                 source: root.tab.favicon;
                 width: 16px;
                 height: 16px;
                 image-fit: contain;
             }
-            if !root.tab.loading && !root.tab.private && root.tab.favicon.width == 0: Path {
+            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.tab.favicon.width == 0: Path {
                 y: (parent.height - self.height) / 2;
                 width: 16px;
                 height: 16px;
@@ -383,6 +409,36 @@ component TabItem inherits Rectangle {
                 x: parent.width - 24px;
                 width: 24px;
                 background: @linear-gradient(90deg, root.fill.with-alpha(0) 0%, root.fill 100%);
+            }
+        }
+
+        // Chrome's audio indicator; clicking it mutes or unmutes the tab.
+        if root.sound && !root.compact: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 20px;
+                height: 20px;
+                border-radius: 10px;
+                background: mute-touch.pressed ? Theme.pressed : mute-touch.has-hover ? Theme.hover : transparent;
+                mute-touch := TouchArea {
+                    clicked => {
+                        root.toggle-mute();
+                    }
+                }
+
+                Path {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    width: 16px;
+                    height: 16px;
+                    viewbox-width: 24;
+                    viewbox-height: 24;
+                    commands: root.tab.muted ? Icons.speaker-muted : Icons.speaker;
+                    stroke: root.dark ? #e8e8f0 : Theme.icon;
+                    stroke-width: 1.75px;
+                    stroke-line-cap: round;
+                    stroke-line-join: round;
+                }
             }
         }
 
@@ -449,7 +505,7 @@ component SuggestionRow inherits Rectangle {
                 height: 16px;
                 viewbox-width: 24;
                 viewbox-height: 24;
-                commands: root.item.kind == "search" ? Icons.search : root.item.kind == "bookmark" ? Icons.star : root.item.kind == "history" ? Icons.history : Icons.globe;
+                commands: root.item.kind == "search" ? Icons.search : root.item.kind == "bookmark" ? Icons.star : root.item.kind == "history" ? Icons.history : root.item.kind == "tab" ? Icons.tab : Icons.globe;
                 stroke: Theme.icon;
                 stroke-width: 1.75px;
                 stroke-line-cap: round;
@@ -470,15 +526,15 @@ component SuggestionRow inherits Rectangle {
             max-width: self.preferred-width;
         }
 
-        if root.item.kind == "bookmark" || root.item.kind == "history": Text {
-            text: " – " + root.item.url;
+        if root.item.kind == "bookmark" || root.item.kind == "history" || root.item.kind == "tab": Text {
+            text: root.item.kind == "tab" ? " – 切換到這個分頁" : " – " + root.item.url;
             font-size: 14px;
             color: Theme.accent;
             vertical-alignment: center;
             overflow: elide;
             horizontal-stretch: 1;
         }
-        if root.item.kind != "bookmark" && root.item.kind != "history": Rectangle {
+        if root.item.kind != "bookmark" && root.item.kind != "history" && root.item.kind != "tab": Rectangle {
             horizontal-stretch: 1;
         }
     }
@@ -993,6 +1049,7 @@ export component AppWindow inherits Window {
     callback select-tab(int);
     callback close-tab(int);
     callback tab-context-menu(int);
+    callback toggle-tab-mute(int);
     // The ⋮ button; its bottom-right corner in window coordinates, where the menu hangs from.
     callback main-menu(length, length);
     // Right-click on the omnibox; Rust shows a native edit menu (a Slint one would sink under
@@ -1001,6 +1058,8 @@ export component AppWindow inherits Window {
     callback navigate(string);
     callback open-url(string);
     callback open-url-new-tab(string);
+    // A suggestion for an open tab was picked: that tab's id.
+    callback switch-to-tab(int);
     callback go-back();
     callback go-forward();
     callback reload();
@@ -1039,6 +1098,14 @@ export component AppWindow inherits Window {
     public function focus-address() {
         address-input.focus();
         address-input.select-all();
+    }
+
+    function open-suggestion(s: SuggestionData) {
+        if (s.kind == "tab") {
+            root.switch-to-tab(s.tab-id);
+        } else {
+            root.open-url(s.url);
+        }
     }
 
     public function address-action(action: string) {
@@ -1295,6 +1362,9 @@ export component AppWindow inherits Window {
                     }
                     context-menu => {
                         root.tab-context-menu(i);
+                    }
+                    toggle-mute => {
+                        root.toggle-tab-mute(i);
                     }
                 }
 
@@ -2600,7 +2670,7 @@ export component AppWindow inherits Window {
                             }
                             accepted => {
                                 if (root.suggestions-open && root.selected-suggestion >= 0 && root.selected-suggestion < root.suggestions.length) {
-                                    root.open-url(root.suggestions[root.selected-suggestion].url);
+                                    root.open-suggestion(root.suggestions[root.selected-suggestion]);
                                 } else {
                                     root.navigate(self.text);
                                 }
@@ -2640,7 +2710,7 @@ export component AppWindow inherits Window {
                     item: s;
                     selected: i == root.selected-suggestion;
                     clicked => {
-                        root.open-url(s.url);
+                        root.open-suggestion(s);
                     }
                     middle-clicked => {
                         root.open-url-new-tab(s.url);

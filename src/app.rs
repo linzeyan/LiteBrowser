@@ -25,7 +25,7 @@ use crate::paths::Paths;
 use crate::platform::{self, MenuItem};
 use crate::shortcuts::{self, Shortcut};
 use crate::storage::{
-    self, Bookmarks, FolderEntry, History, Session, SessionTab, SuggestionKind, WindowState, OTHER_FOLDER,
+    self, Bookmarks, FolderEntry, History, Session, SessionTab, SuggestionKind, WindowState, ZoomLevels, OTHER_FOLDER,
 };
 use crate::tabs::{self, Action, MemoryState, Policy, Residency, TabId, TabSnapshot};
 use crate::url_input;
@@ -64,6 +64,8 @@ pub enum UiEvent {
     Navigate(String),
     OpenUrl(String),
     OpenUrlNewTab(String),
+    /// An open tab was picked from the address bar's suggestions.
+    SwitchToTab(TabId),
     Back,
     Forward,
     Reload,
@@ -93,6 +95,8 @@ pub enum UiEvent {
     DismissNotice,
     GeometryChanged,
     TabContextMenu(usize),
+    /// The tab's speaker icon was clicked.
+    ToggleMute(usize),
     /// The ⋮ button was clicked; its bottom-right corner in logical window coordinates.
     MainMenu(f32, f32),
     AddressMenu,
@@ -371,11 +375,13 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_select_tab(|i| ui_post(UiEvent::SelectTab(i.max(0) as usize)));
     ui.on_close_tab(|i| ui_post(UiEvent::CloseTab(i.max(0) as usize)));
     ui.on_tab_context_menu(|i| ui_post(UiEvent::TabContextMenu(i.max(0) as usize)));
+    ui.on_toggle_tab_mute(|i| ui_post(UiEvent::ToggleMute(i.max(0) as usize)));
     ui.on_main_menu(|x, y| ui_post(UiEvent::MainMenu(x, y)));
     ui.on_address_menu(|| ui_post(UiEvent::AddressMenu));
     ui.on_navigate(|text| ui_post(UiEvent::Navigate(text.into())));
     ui.on_open_url(|url| ui_post(UiEvent::OpenUrl(url.into())));
     ui.on_open_url_new_tab(|url| ui_post(UiEvent::OpenUrlNewTab(url.into())));
+    ui.on_switch_to_tab(|id| ui_post(UiEvent::SwitchToTab(id.max(0) as TabId)));
     ui.on_go_back(|| ui_post(UiEvent::Back));
     ui.on_go_forward(|| ui_post(UiEvent::Forward));
     ui.on_reload(|| ui_post(UiEvent::Reload));
@@ -470,6 +476,13 @@ struct Tab {
     private: bool,
     /// Memory of the renderers running this tab, from the last measurement; 0 when unknown.
     bytes: u64,
+    /// The page last reported, when it went to the background, that it holds text the user
+    /// has not sent.
+    unsaved: bool,
+    /// The page plays sound (even while muted).
+    audible: bool,
+    /// The user muted the tab; outlives its WebView, like its URL.
+    muted: bool,
 }
 
 impl Tab {
@@ -491,7 +504,20 @@ impl Tab {
             favicon: Image::default(),
             private: false,
             bytes: 0,
+            unsaved: false,
+            audible: false,
+            muted: false,
         }
+    }
+
+    /// Lets go of the WebView and of everything that only lived in its page.
+    fn drop_view(&mut self) {
+        self.view = None;
+        self.suspended = false;
+        self.loading = false;
+        self.bytes = 0;
+        self.unsaved = false;
+        self.audible = false;
     }
 
     fn residency(&self) -> Residency {
@@ -531,6 +557,7 @@ struct App {
     closed: Vec<SessionTab>,
     bookmarks: Bookmarks,
     history: History,
+    zoom: ZoomLevels,
     page: Page,
     suggestions_open: bool,
     address_focused: bool,
@@ -606,6 +633,7 @@ impl App {
             blocklist: Rc::new(Blocklist::load(&paths.blocklist())),
             bookmarks: Bookmarks::load(&paths.bookmarks()),
             history: History::load(&paths.history()),
+            zoom: ZoomLevels::load(&paths.zoom()),
             favicons,
             ui,
             paths,
@@ -769,6 +797,7 @@ impl App {
     fn save_all(&mut self) {
         self.bookmarks.save_if_dirty();
         self.history.save_if_dirty();
+        self.zoom.save_if_dirty();
         self.save_session();
         self.last_save_ms = self.now_ms();
     }
@@ -827,6 +856,7 @@ impl App {
             UiEvent::SelectTab(i) => self.activate(i),
             UiEvent::CloseTab(i) => self.close_tab(i),
             UiEvent::TabContextMenu(i) => self.tab_context_menu(i),
+            UiEvent::ToggleMute(i) => self.toggle_mute(i),
             UiEvent::MainMenu(x, y) => self.main_menu(x, y),
             UiEvent::AddressMenu => self.address_menu(),
             UiEvent::Navigate(text) => {
@@ -840,6 +870,11 @@ impl App {
                 self.insert_tab(at, url, String::new(), None);
                 self.refresh_tabs();
                 self.refresh_status();
+            }
+            UiEvent::SwitchToTab(id) => {
+                if let Some(idx) = self.index_of(id) {
+                    self.activate(idx);
+                }
             }
             UiEvent::Back => self.with_active_view(WebView::go_back),
             UiEvent::Forward => self.with_active_view(WebView::go_forward),
@@ -992,6 +1027,7 @@ impl App {
                 }
             }
             Shortcut::ToggleDevtools => self.toggle_devtools(),
+            Shortcut::ResetZoom => self.set_site_zoom(self.active, 1.0),
         }
     }
 
@@ -1228,6 +1264,9 @@ impl App {
         };
         match attached {
             Ok(view) => {
+                if self.tabs[idx].muted {
+                    view.set_muted(true);
+                }
                 match new_window {
                     // The page's window.open() gets this WebView, so window.opener keeps working.
                     Some(req) => unsafe {
@@ -1242,6 +1281,7 @@ impl App {
                 let tab = &mut self.tabs[idx];
                 tab.view = Some(view);
                 tab.suspended = false;
+                self.apply_zoom(idx);
                 self.layout_views();
                 // Focus the page unless the user has started typing a new address meanwhile.
                 if idx == self.active && self.page == Page::Web && !self.address_edited {
@@ -1342,10 +1382,7 @@ impl App {
             return;
         }
         log!("tab {id}: discarded ({} MB)", tab.bytes >> 20);
-        tab.view = None;
-        tab.bytes = 0;
-        tab.suspended = false;
-        tab.loading = false;
+        tab.drop_view();
     }
 
     fn suspend(&mut self, id: TabId) {
@@ -1358,6 +1395,36 @@ impl App {
             view.set_visible(false);
             view.try_suspend(id);
             tab.suspended = true;
+        }
+    }
+
+    /// Puts the tab's page at the zoom its site was last left at.
+    fn apply_zoom(&self, idx: usize) {
+        let Some(view) = self.tabs.get(idx).and_then(|t| t.view.as_ref()) else { return };
+        let target = url_input::host_of(&self.tabs[idx].url).map_or(1.0, |host| self.zoom.get(&host));
+        if (view.zoom() - target).abs() > 0.001 {
+            view.set_zoom(target);
+        }
+    }
+
+    /// Makes `factor` the zoom of the tab's site: remembered, and the site's other tabs follow,
+    /// like Chrome.
+    fn set_site_zoom(&mut self, idx: usize, factor: f64) {
+        let tab = &self.tabs[idx];
+        // WebView2 keeps a zoom we set across the tab's navigations, but drops one made with
+        // Ctrl+± or the wheel on the next page and reports that drop as a change, which would
+        // forget the site's zoom. Setting it ourselves makes it stick. Our own sets raise no
+        // ZoomFactorChanged, so this does not come back here.
+        if let Some(view) = &tab.view {
+            view.set_zoom(factor);
+        }
+        // A private tab follows the sites' zoom but leaves no record of its visits.
+        let Some(host) = url_input::host_of(&tab.url).filter(|_| !tab.private) else { return };
+        self.zoom.set(&host, factor);
+        for i in 0..self.tabs.len() {
+            if i != idx && url_input::host_of(&self.tabs[i].url).as_deref() == Some(host.as_str()) {
+                self.apply_zoom(i);
+            }
         }
     }
 
@@ -1378,6 +1445,9 @@ impl App {
                 residency: t.residency(),
                 active: i == self.active,
                 pinned: t.pinned,
+                unsaved: t.unsaved,
+                // Muting is how the user says the sound may go.
+                audible: t.audible && !t.muted,
                 last_active_ms: t.last_active_ms,
                 bytes: t.bytes,
             })
@@ -1433,6 +1503,10 @@ impl App {
                     // Show a cached icon immediately; a fresh one may arrive via FaviconChanged.
                     self.set_tab_favicon_from_cache(idx);
                 }
+                // The page's zoom carries across navigations, so each site gets its own here. On
+                // every change, not only when the URL differs: the omnibox and MCP set the tab's
+                // URL before the page loads.
+                self.apply_zoom(idx);
                 let tab = &mut self.tabs[idx];
                 if tab.recorded_url != tab.url && !tab.private {
                     tab.recorded_url = tab.url.clone();
@@ -1446,6 +1520,8 @@ impl App {
             }
             EngineEvent::NavigationStarting => {
                 self.tabs[idx].loading = true;
+                // The new document starts without the old one's typing.
+                self.tabs[idx].unsaved = false;
                 self.refresh_tabs();
                 if is_active {
                     self.refresh_toolbar();
@@ -1468,9 +1544,7 @@ impl App {
             EngineEvent::NewWindow(req) => self.on_new_window(idx, req),
             EngineEvent::CloseRequested => self.close_tab(idx),
             EngineEvent::RendererGone => {
-                self.tabs[idx].view = None;
-                self.tabs[idx].suspended = false;
-                self.tabs[idx].loading = false;
+                self.tabs[idx].drop_view();
                 if is_active && self.page == Page::Web {
                     self.set_status("分頁的網頁程序結束了，已重新載入");
                     self.ensure_view(idx);
@@ -1487,6 +1561,20 @@ impl App {
                     }
                 }
                 self.refresh_tabs();
+            }
+            EngineEvent::UnsavedInput(unsaved) => {
+                // Explains in the log why a tab stays loaded past its discard time.
+                if self.tabs[idx].unsaved != unsaved {
+                    log!("tab {id}: {}", if unsaved { "holds unsent input" } else { "unsent input gone" });
+                }
+                self.tabs[idx].unsaved = unsaved;
+            }
+            EngineEvent::Audible(playing) => {
+                self.tabs[idx].audible = playing;
+                self.refresh_tabs();
+            }
+            EngineEvent::Zoom(factor) => {
+                self.set_site_zoom(idx, factor);
             }
             EngineEvent::FullScreen(on) => {
                 // A background tab's video must not take over the window.
@@ -1558,10 +1646,8 @@ impl App {
         }
         log!("WebView2 browser process exited; restarting");
         for tab in &mut self.tabs {
-            tab.view = None;
+            tab.drop_view();
             tab.creating = false;
-            tab.suspended = false;
-            tab.loading = false;
         }
         win::set_active_controller(None);
         self.env = None;
@@ -1579,8 +1665,16 @@ impl App {
             self.set_suggestions_open(false);
             return;
         }
+        // Private tabs stay out, as in Chrome, where they live in a window of their own.
+        let open: Vec<(TabId, &str, &str)> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(i, t)| *i != self.active && !t.private && !t.url.is_empty())
+            .map(|(_, t)| (t.id, t.title.as_str(), t.url.as_str()))
+            .collect();
         let items: Vec<SuggestionData> =
-            storage::suggestions(&text, &self.bookmarks, &self.history, &self.cfg.search_url, 8)
+            storage::suggestions(&text, &open, &self.bookmarks, &self.history, &self.cfg.search_url, 8)
                 .into_iter()
                 .map(|s| SuggestionData {
                     title: s.title.into(),
@@ -1590,8 +1684,10 @@ impl App {
                         SuggestionKind::Url => "url",
                         SuggestionKind::Bookmark => "bookmark",
                         SuggestionKind::History => "history",
+                        SuggestionKind::Tab(_) => "tab",
                     }
                     .into(),
+                    tab_id: if let SuggestionKind::Tab(id) = s.kind { id as i32 } else { -1 },
                 })
                 .collect();
         self.models.suggestions.set_vec(items);
@@ -1913,6 +2009,7 @@ impl App {
         if now.saturating_sub(self.last_save_ms) > 30_000 {
             self.bookmarks.save_if_dirty();
             self.history.save_if_dirty();
+            self.zoom.save_if_dirty();
             if self.session_dirty {
                 self.save_session();
             }
@@ -1946,6 +2043,8 @@ impl App {
                 pinned: t.pinned,
                 favicon: t.favicon.clone(),
                 private: t.private,
+                audible: t.audible,
+                muted: t.muted,
             })
             .collect();
         self.models.tabs.set_vec(data);
@@ -2096,11 +2195,21 @@ impl App {
     fn tab_context_menu(&mut self, idx: usize) {
         let Some(tab) = self.tabs.get(idx) else { return };
         let pinned = tab.pinned;
+        let (id, releasable) = (tab.id, idx != self.active && tab.view.is_some() && !tab.creating);
+        // The size the measurement put on this tab, so the user can see what releasing it buys.
+        let release = match (tab.bytes >> 20, tab.unsaved) {
+            (0, false) => "釋放分頁".to_string(),
+            (0, true) => "釋放分頁（有未送出的輸入）".to_string(),
+            (mb, false) => format!("釋放分頁（目前 {mb} MB）"),
+            (mb, true) => format!("釋放分頁（目前 {mb} MB，有未送出的輸入）"),
+        };
         let menu = vec![
             MenuItem::entry(1, if pinned { "取消釘選" } else { "釘選分頁" }),
             MenuItem::entry(2, "複製分頁"),
             MenuItem::entry(10, "開新無痕分頁"),
             MenuItem::entry(3, "重新載入"),
+            MenuItem::entry(12, if tab.muted { "取消分頁靜音" } else { "將分頁靜音" }),
+            if releasable { MenuItem::entry(11, release) } else { MenuItem::disabled(release) },
             MenuItem::Separator,
             MenuItem::entry(4, "往左移"),
             MenuItem::entry(5, "往右移"),
@@ -2127,8 +2236,23 @@ impl App {
             8 => self.close_tabs_to_right(idx),
             9 => self.run_shortcut(Shortcut::ReopenClosedTab),
             10 => self.run_shortcut(Shortcut::NewPrivateTab),
+            11 => {
+                self.discard(id);
+                self.refresh_tabs();
+                self.refresh_status();
+            }
+            12 => self.toggle_mute(idx),
             _ => {}
         }
+    }
+
+    fn toggle_mute(&mut self, idx: usize) {
+        let Some(tab) = self.tabs.get_mut(idx) else { return };
+        tab.muted = !tab.muted;
+        if let Some(view) = &tab.view {
+            view.set_muted(tab.muted);
+        }
+        self.refresh_tabs();
     }
 
     fn bookmark_menu(&mut self, idx: usize) {

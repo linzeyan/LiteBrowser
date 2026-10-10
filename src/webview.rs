@@ -14,10 +14,12 @@ use webview2_com::{
     ExecuteScriptCompletedHandler, GetProcessExtendedInfosCompletedHandler,
     BrowserExtensionRemoveCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
-    GetFaviconCompletedHandler, HistoryChangedEventHandler, NavigationCompletedEventHandler,
+    GetFaviconCompletedHandler, HistoryChangedEventHandler, IsDocumentPlayingAudioChangedEventHandler,
+    NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
     ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler, SourceChangedEventHandler,
-    TrySuspendCompletedHandler, WebResourceRequestedEventHandler, WindowCloseRequestedEventHandler,
+    TrySuspendCompletedHandler, WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
+    WindowCloseRequestedEventHandler, ZoomFactorChangedEventHandler,
 };
 use windows::core::{Interface, BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
@@ -61,7 +63,39 @@ pub enum EngineEvent {
     Favicon(Vec<u8>),
     /// The page entered or left HTML5 full screen (a video player, a slide deck).
     FullScreen(bool),
+    /// Sent as the page goes to the background: whether it holds text the user has not sent.
+    UnsavedInput(bool),
+    /// The page started or stopped playing sound (true even while muted).
+    Audible(bool),
+    /// The page's zoom changed by Ctrl+±/wheel, or WebView2 dropped such a zoom on the next page.
+    /// Never for `set_zoom`.
+    Zoom(f64),
 }
+
+/// Reports, each time the page is hidden, whether a field the user typed into since it loaded
+/// still has text. Checking then — a page is only discarded while in the background — instead of
+/// on every keystroke also catches editors that empty themselves after sending (Claude, ClickUp
+/// comments), which fire no input event when they do.
+// ponytail: main frame only (a frame's messages need a handler per frame), so typing into an
+// editor inside an iframe goes unseen; add ICoreWebView2Frame handlers if one matters.
+const UNSAVED_INPUT_SCRIPT: &str = r#"(() => {
+  if (window !== window.top || !window.chrome || !window.chrome.webview) return;
+  const typed = new Set();
+  // Leftover text in these is not the user's work.
+  const skip = /^(search|password|hidden|checkbox|radio|file|range|color|button|submit|reset|image)$/;
+  addEventListener('input', (e) => {
+    const el = e.composedPath()[0];
+    if (!e.isTrusted || !(el instanceof HTMLElement) || /^(combobox|searchbox)$/.test(el.getAttribute('role') || '')) return;
+    if (el.isContentEditable || el instanceof HTMLTextAreaElement || (el instanceof HTMLInputElement && !skip.test(el.type))) typed.add(el);
+  }, true);
+  addEventListener('submit', () => typed.clear(), true);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'hidden') return;
+    for (const el of typed) if (!el.isConnected) typed.delete(el);
+    const unsaved = [...typed].some((el) => ('value' in el ? el.value : el.innerText).trim() !== '');
+    chrome.webview.postMessage(unsaved ? 'lb:unsaved' : 'lb:saved');
+  });
+})();"#;
 
 /// `window.open()` / target=_blank / "open in new window" from a page.
 pub struct NewWindowRequest {
@@ -316,6 +350,28 @@ impl WebView {
                 &mut token,
             )?;
 
+            // Any page could send these, but all it gains is being frozen instead of discarded.
+            core.add_WebMessageReceived(
+                &WebMessageReceivedEventHandler::create(Box::new(move |_, args| {
+                    let Some(args) = args else { return Ok(()) };
+                    let mut message = PWSTR::null();
+                    if args.TryGetWebMessageAsString(&mut message).is_ok() {
+                        match take_pwstr(message).as_str() {
+                            "lb:unsaved" => post_engine(tab, EngineEvent::UnsavedInput(true)),
+                            "lb:saved" => post_engine(tab, EngineEvent::UnsavedInput(false)),
+                            _ => {}
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+            // Optional: without it a tab can lose typed text when discarded, as before.
+            let _ = core.AddScriptToExecuteOnDocumentCreated(
+                &HSTRING::from(UNSAVED_INPUT_SCRIPT),
+                None::<&ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>,
+            );
+
             core.add_WindowCloseRequested(
                 &WindowCloseRequestedEventHandler::create(Box::new(move |_, _| {
                     post_engine(tab, EngineEvent::CloseRequested);
@@ -369,6 +425,18 @@ impl WebView {
                 &mut token,
             )?;
 
+            controller.add_ZoomFactorChanged(
+                &ZoomFactorChangedEventHandler::create(Box::new(move |sender, _| {
+                    if let Some(controller) = sender {
+                        let mut factor = 1.0;
+                        controller.ZoomFactor(&mut factor)?;
+                        post_engine(tab, EngineEvent::Zoom(factor));
+                    }
+                    Ok(())
+                })),
+                &mut token,
+            )?;
+
             // Favicons: ICoreWebView2_15 (newer runtimes). Ignored on older ones.
             if let Ok(wv15) = core.cast::<ICoreWebView2_15>() {
                 let wv15_for_fetch = wv15.clone();
@@ -395,6 +463,21 @@ impl WebView {
                             Ok(())
                         }));
                         let _ = wv15_for_fetch.GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &handler);
+                        Ok(())
+                    })),
+                    &mut token,
+                )?;
+            }
+
+            // Sound: ICoreWebView2_8 (runtime 100 has it).
+            if let Ok(wv8) = core.cast::<ICoreWebView2_8>() {
+                wv8.add_IsDocumentPlayingAudioChanged(
+                    &IsDocumentPlayingAudioChangedEventHandler::create(Box::new(move |sender, _| {
+                        if let Some(wv8) = sender.and_then(|s| s.cast::<ICoreWebView2_8>().ok()) {
+                            let mut playing = BOOL(0);
+                            wv8.IsDocumentPlayingAudio(&mut playing)?;
+                            post_engine(tab, EngineEvent::Audible(playing.as_bool()));
+                        }
                         Ok(())
                     })),
                     &mut token,
@@ -487,6 +570,28 @@ impl WebView {
                 if low { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_LOW } else { COREWEBVIEW2_MEMORY_USAGE_TARGET_LEVEL_NORMAL };
             unsafe {
                 let _ = wv19.SetMemoryUsageTargetLevel(level);
+            }
+        }
+    }
+
+    pub fn zoom(&self) -> f64 {
+        let mut factor = 1.0;
+        unsafe {
+            let _ = self.controller.ZoomFactor(&mut factor);
+        }
+        factor
+    }
+
+    pub fn set_zoom(&self, factor: f64) {
+        unsafe {
+            let _ = self.controller.SetZoomFactor(factor);
+        }
+    }
+
+    pub fn set_muted(&self, muted: bool) {
+        if let Ok(wv8) = self.core.cast::<ICoreWebView2_8>() {
+            unsafe {
+                let _ = wv8.SetIsMuted(muted);
             }
         }
     }

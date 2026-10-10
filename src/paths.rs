@@ -34,6 +34,9 @@ impl Paths {
     pub fn session(&self) -> PathBuf {
         self.root.join("session.json")
     }
+    pub fn zoom(&self) -> PathBuf {
+        self.root.join("zoom.json")
+    }
     pub fn blocklist(&self) -> PathBuf {
         self.root.join("blocklist.txt")
     }

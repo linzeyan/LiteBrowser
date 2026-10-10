@@ -22,6 +22,8 @@ pub enum Shortcut {
     ToggleFullScreen,
     ExitFullScreen,
     ToggleDevtools,
+    /// Ctrl+0: WebView2 zooms on Ctrl+± and the wheel by itself, but has no key back to 100 %.
+    ResetZoom,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -39,8 +41,9 @@ const VK_F6: u32 = 0x75;
 const VK_F11: u32 = 0x7A;
 const VK_F12: u32 = 0x7B;
 const VK_ESCAPE: u32 = 0x1B;
+const VK_NUMPAD0: u32 = 0x60;
 
-/// Shortcuts we take away from the web page. Everything else (F5, Ctrl+F, Alt+Left, zoom…)
+/// Shortcuts we take away from the web page. Everything else (F5, Ctrl+F, Alt+Left, Ctrl+±…)
 /// is left to WebView2's built-in handling.
 pub fn from_virtual_key(vk: u32, m: Modifiers) -> Option<Shortcut> {
     let key = char::from_u32(vk).filter(|c| c.is_ascii_alphanumeric());
@@ -56,6 +59,7 @@ pub fn from_virtual_key(vk: u32, m: Modifiers) -> Option<Shortcut> {
             (VK_PRIOR, _) => Some(Shortcut::PrevTab),
             (_, Some(c @ '1'..='8')) => Some(Shortcut::SelectTab(c as usize - '1' as usize)),
             (_, Some('9')) => Some(Shortcut::LastTab),
+            (_, Some('0')) | (VK_NUMPAD0, _) => Some(Shortcut::ResetZoom),
             _ => None,
         },
         (true, true, false) => match (vk, key) {
@@ -150,6 +154,14 @@ mod tests {
         assert_eq!(from_virtual_key_in_fullscreen(VK_ESCAPE, CTRL_SHIFT), None, "the page keeps Ctrl+Shift+Esc");
         // Everything else works the same either way.
         assert_eq!(from_virtual_key_in_fullscreen('T' as u32, CTRL), Some(Shortcut::NewTab));
+    }
+
+    #[test]
+    fn ctrl_0_resets_zoom() {
+        // WebView2 ignores Ctrl+0, which would leave a site's remembered zoom with no quick way back.
+        assert_eq!(from_virtual_key('0' as u32, CTRL), Some(Shortcut::ResetZoom));
+        assert_eq!(from_virtual_key(VK_NUMPAD0, CTRL), Some(Shortcut::ResetZoom));
+        assert_eq!(from_virtual_key(0xBB, CTRL), None, "Ctrl+= stays with WebView2");
     }
 
     #[test]
