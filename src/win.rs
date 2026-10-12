@@ -12,9 +12,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsChild, IsWindowVisible, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
-    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MOVE, WM_MOVING,
-    WM_SETICON, WM_SIZE, WS_CLIPCHILDREN,
+    ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SC_KEYMENU, SWP_FRAMECHANGED, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MOVE,
+    WM_MOVING, WM_SETICON, WM_SIZE, WM_SYSCOMMAND, WS_CLIPCHILDREN,
 };
 
 thread_local! {
@@ -150,6 +150,10 @@ unsafe extern "system" fn subclass_proc(
                 }
             }
         },
+        // A lone Alt (or F10) puts the window into the menu bar's keyboard mode. With no menu bar
+        // nothing shows, and the next click only ends the mode: a tab could not be clicked or
+        // dragged. Chrome never enters it. Alt+Space (lparam ' ') still opens the system menu.
+        WM_SYSCOMMAND if (wparam.0 & 0xFFF0) as u32 == SC_KEYMENU && lparam.0 == 0 => return LRESULT(0),
         _ => {}
     }
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }

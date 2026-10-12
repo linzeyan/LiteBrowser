@@ -1,7 +1,7 @@
 //! Process- and OS-level Windows helpers: DPAPI, system memory, single instance, app identity,
 //! native popup menus, and the file-open dialog. (Window/HWND glue lives in `win`.)
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 
 use windows::core::{HSTRING, PCWSTR};
@@ -155,6 +155,29 @@ impl MenuItem {
 
 thread_local! {
     static OWNER: RefCell<Option<HWND>> = const { RefCell::new(None) };
+    static MENUS_DARK: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Makes the native menus dark or light to match the browser. Windows has no public switch for
+/// this; uxtheme's SetPreferredAppMode (ordinal 135, Windows 10 1903+) and FlushMenuThemes (136)
+/// are what Explorer and Notepad use. Where they are missing the menus just stay light.
+pub fn set_dark_menus(dark: bool) {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    if MENUS_DARK.replace(dark) == dark {
+        return;
+    }
+    unsafe {
+        let Ok(uxtheme) = LoadLibraryW(windows::core::w!("uxtheme.dll")) else { return };
+        // Ordinals travel in the name pointer's address, like MAKEINTRESOURCE.
+        let ordinal = |n: usize| GetProcAddress(uxtheme, windows::core::PCSTR(std::ptr::without_provenance(n)));
+        if let (Some(set_mode), Some(flush)) = (ordinal(135), ordinal(136)) {
+            let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(set_mode);
+            let flush: unsafe extern "system" fn() = std::mem::transmute(flush);
+            // 2 = ForceDark; 0 = Default, the light menus every app starts with.
+            set_mode(if dark { 2 } else { 0 });
+            flush();
+        }
+    }
 }
 
 /// Remembers the owner window used for popup menus (so they dismiss correctly).

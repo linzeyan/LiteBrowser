@@ -623,6 +623,9 @@ struct App {
     pending_devtools_url: Option<String>,
     /// The tab the docked DevTools inspect.
     devtools_tab: TabId,
+    /// Tabs whose DevTools the user left open. Like Chrome they come back with the tab, but only
+    /// the tab in front has a DevTools WebView: one per tab would cost a renderer each.
+    devtools_tabs: HashSet<TabId>,
     /// A hidden WebView for the extensions page while no tab has one: extensions live in the
     /// WebView2 profile, and only a WebView leads to it.
     extension_host: Option<WebView>,
@@ -706,6 +709,7 @@ impl App {
             devtools_creating: false,
             pending_devtools_url: None,
             devtools_tab: 0,
+            devtools_tabs: HashSet::new(),
             extension_host: None,
             extension_host_creating: false,
             launch_url,
@@ -1212,6 +1216,7 @@ impl App {
                 }
             }
         }
+        self.reopen_devtools();
         self.session_dirty = true;
         self.refresh_all();
         self.apply_policy(None);
@@ -1622,6 +1627,7 @@ impl App {
                 self.refresh_tabs();
                 if is_active {
                     self.refresh_toolbar();
+                    self.reopen_devtools();
                 }
             }
             EngineEvent::HistoryChanged { can_back, can_forward } => {
@@ -1880,6 +1886,7 @@ impl App {
             for view in self.tabs.iter().filter_map(|t| t.view.as_ref()) {
                 view.set_dark(self.cfg.dark_mode);
             }
+            platform::set_dark_menus(self.dark_ui());
         }
         let needs_restart = old.disable_gpu != self.cfg.disable_gpu
             || old.adblock != self.cfg.adblock
@@ -2142,7 +2149,13 @@ impl App {
     // -----------------------------------------------------------------------------------------
     // Pushing state to the UI
 
+    /// The same rule as the UI's dark look (app.slint): the setting, or a private tab in front.
+    fn dark_ui(&self) -> bool {
+        self.cfg.dark_mode || self.tabs.get(self.active).is_some_and(|t| t.private)
+    }
+
     fn refresh_all(&mut self) {
+        platform::set_dark_menus(self.dark_ui());
         self.ui.set_suggestions_open(self.suggestions_open);
         self.refresh_tabs();
         self.refresh_toolbar();
@@ -2768,20 +2781,40 @@ impl App {
     // Docked DevTools
 
     fn toggle_devtools(&mut self) {
+        let Some(id) = self.tabs.get(self.active).map(|t| t.id) else { return };
         if self.devtools_view.is_some() || self.devtools_creating {
+            self.devtools_tabs.remove(&id);
             self.close_devtools();
             return;
         }
-        if self.page() != Page::Web || self.tabs.get(self.active).map(|t| t.view.is_none()).unwrap_or(true) {
+        if self.page() != Page::Web || self.tabs[self.active].view.is_none() {
             self.set_status("請先開啟網頁再使用開發人員工具");
             return;
         }
+        self.devtools_tabs.insert(id);
+        self.open_devtools();
+    }
+
+    /// Brings back the DevTools the active tab had open, once its page is there to attach to (a
+    /// released tab gets its page back only after it loads again).
+    fn reopen_devtools(&mut self) {
+        let Some(tab) = self.tabs.get(self.active) else { return };
+        let ready = tab.view.is_some() && !tab.loading && page_of(&tab.url) == Page::Web;
+        if ready && self.devtools_tabs.contains(&tab.id) && self.devtools_view.is_none() && !self.devtools_creating {
+            self.open_devtools();
+        }
+    }
+
+    fn open_devtools(&mut self) {
         let (Some(env), Some(hwnd)) = (self.env.clone(), self.hwnd) else { return };
+        let id = self.tabs[self.active].id;
         let page_url = self.tabs[self.active].url.clone();
         let frontend = match self.devtools_frontend_url(&page_url) {
             Ok(url) => url,
             Err(e) => {
                 log!("docked devtools unavailable ({e}); opening a window instead");
+                // A window of its own does not come and go with the tab.
+                self.devtools_tabs.remove(&id);
                 self.with_active_view(WebView::open_devtools_window);
                 return;
             }
@@ -2790,11 +2823,12 @@ impl App {
             webview::create_controller(&env, hwnd, false, |result| post(Event::DevtoolsViewCreated(result)));
         if let Err(e) = started {
             log!("devtools controller failed: {e}");
+            self.devtools_tabs.remove(&id);
             self.with_active_view(WebView::open_devtools_window);
             return;
         }
         self.devtools_creating = true;
-        self.devtools_tab = self.tabs[self.active].id;
+        self.devtools_tab = id;
         self.pending_devtools_url = Some(frontend);
         self.ui.set_devtools_open(true);
     }
@@ -2831,6 +2865,7 @@ impl App {
             }
             Err(e) => {
                 log!("devtools attach failed: {e}");
+                self.devtools_tabs.remove(&self.devtools_tab);
                 self.ui.set_devtools_open(false);
                 self.with_active_view(WebView::open_devtools_window);
             }
