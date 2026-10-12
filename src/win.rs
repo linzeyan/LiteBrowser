@@ -6,13 +6,15 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetFocus, GetKeyState, GetKeyboardState, SetFocus, SetKeyboardState, VK_CAPITAL, VK_CONTROL, VK_MENU,
+};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsChild, IsWindowVisible, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_LBUTTONDOWN, WM_MOVE, WM_MOVING, WM_SETICON,
-    WM_SIZE, WS_CLIPCHILDREN,
+    SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MOVE, WM_MOVING,
+    WM_SETICON, WM_SIZE, WS_CLIPCHILDREN,
 };
 
 thread_local! {
@@ -126,6 +128,26 @@ unsafe extern "system" fn subclass_proc(
                 let result = DefSubclassProc(hwnd, msg, wparam, lparam);
                 restore_page_focus(hwnd);
                 return result;
+            }
+        },
+        // Slint's editing shortcuts only match lower-case letters, and with Caps Lock on winit
+        // reports Ctrl+V as "V", so copy/paste did nothing in every text field (with 注音, Caps
+        // Lock is how English gets typed). Hide the toggle while winit reads the key.
+        WM_KEYDOWN | WM_KEYUP => unsafe {
+            let down = |vk: u16| GetKeyState(vk as i32) < 0;
+            if down(VK_CONTROL.0) && !down(VK_MENU.0) && GetKeyState(VK_CAPITAL.0 as i32) & 1 != 0 {
+                let mut keys = [0u8; 256];
+                if GetKeyboardState(&mut keys).is_ok() {
+                    keys[VK_CAPITAL.0 as usize] &= !1;
+                    let _ = SetKeyboardState(&keys);
+                    let result = DefSubclassProc(hwnd, msg, wparam, lparam);
+                    // Re-read: handling the key may have moved the rest of the state on.
+                    if GetKeyboardState(&mut keys).is_ok() {
+                        keys[VK_CAPITAL.0 as usize] |= 1;
+                        let _ = SetKeyboardState(&keys);
+                    }
+                    return result;
+                }
             }
         },
         _ => {}

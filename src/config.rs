@@ -40,6 +40,8 @@ pub struct Config {
     /// Reopen the tabs from last time (as discarded tabs, so they cost no memory until opened).
     pub restore_session: bool,
     pub show_bookmarks_bar: bool,
+    /// Dark browser UI, and pages that have a dark look are asked for it.
+    pub dark_mode: bool,
     /// Extra Chromium command-line switches for WebView2. Needs a restart.
     pub extra_browser_args: String,
 }
@@ -63,6 +65,7 @@ impl Default for Config {
             mcp_port: 0,
             restore_session: true,
             show_bookmarks_bar: true,
+            dark_mode: false,
             extra_browser_args: String::new(),
         }
     }

@@ -653,6 +653,19 @@ impl WebView {
         }
     }
 
+    /// Dark asks pages for their dark look (prefers-color-scheme); off leaves it to Windows. The
+    /// setting belongs to the tab's profile, which every normal tab shares.
+    pub fn set_dark(&self, dark: bool) {
+        let scheme = if dark { COREWEBVIEW2_PREFERRED_COLOR_SCHEME_DARK } else { COREWEBVIEW2_PREFERRED_COLOR_SCHEME_AUTO };
+        if let Ok(wv13) = self.core.cast::<ICoreWebView2_13>() {
+            unsafe {
+                if let Ok(profile) = wv13.Profile() {
+                    let _ = profile.SetPreferredColorScheme(scheme);
+                }
+            }
+        }
+    }
+
     pub fn profile(&self) -> Option<ICoreWebView2Profile7> {
         let wv13 = self.core.cast::<ICoreWebView2_13>().ok()?;
         unsafe { wv13.Profile().ok()?.cast::<ICoreWebView2Profile7>().ok() }

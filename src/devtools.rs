@@ -59,8 +59,8 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
     );
     stream.write_all(request.as_bytes()).map_err(|e| format!("要求失敗：{e}"))?;
 
-    // Read until the server closes the connection. A timeout after some data has arrived is not
-    // fatal — keep whatever we got and try to parse it.
+    // Read until the response is whole or the server closes the connection. A timeout after some
+    // data has arrived is not fatal — keep whatever we got and try to parse it.
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
@@ -68,7 +68,7 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
             Ok(0) => break,
             Ok(n) => {
                 raw.extend_from_slice(&chunk[..n]);
-                if raw.len() > 4 * 1024 * 1024 {
+                if response_complete(&raw) || raw.len() > 4 * 1024 * 1024 {
                     break;
                 }
             }
@@ -79,6 +79,24 @@ fn http_get(port: u16, path: &str) -> Result<String, String> {
     let response = String::from_utf8_lossy(&raw).into_owned();
     let body = response.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(&response);
     Ok(dechunk(body))
+}
+
+/// Whether `raw` holds a whole HTTP response. Chromium's DevTools server keeps the socket open
+/// despite "Connection: close", so waiting for it to hang up froze the window for the whole read
+/// timeout on every F12.
+fn response_complete(raw: &[u8]) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else { return false };
+    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+    let body = &raw[end + 4..];
+    for line in head.lines() {
+        if let Some(len) = line.strip_prefix("content-length:") {
+            return len.trim().parse().is_ok_and(|n: usize| body.len() >= n);
+        }
+        if line.starts_with("transfer-encoding:") && line.contains("chunked") {
+            return body.ends_with(b"0\r\n\r\n");
+        }
+    }
+    false
 }
 
 /// Undoes `Transfer-Encoding: chunked` framing when the server used it.
@@ -202,6 +220,19 @@ mod tests {
         let chunked = "2\r\n[]\r\n0\r\n\r\n";
         assert_eq!(dechunk(chunked), "[]");
         assert_eq!(dechunk("[1]"), "[1]");
+    }
+
+    #[test]
+    fn stops_reading_once_the_response_is_whole() {
+        // The server never hangs up, so the declared length (or the last chunk) is the only end.
+        let head = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: application/json\r\n\r\n";
+        assert!(!response_complete(b"HTTP/1.1 200 OK\r\nContent-Le"));
+        assert!(!response_complete(head.as_bytes()));
+        assert!(!response_complete(format!("{head}[").as_bytes()));
+        assert!(response_complete(format!("{head}[]").as_bytes()));
+        let chunked = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n[]\r\n";
+        assert!(!response_complete(chunked.as_bytes()));
+        assert!(response_complete(format!("{chunked}0\r\n\r\n").as_bytes()));
     }
 
     #[test]

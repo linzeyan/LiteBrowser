@@ -114,6 +114,16 @@ pub fn unpack(zip_bytes: &[u8], dest: &Path) -> Result<usize, String> {
     Ok(written)
 }
 
+/// Where the extension in a folder of the extensions folder actually is: the folder itself, or
+/// the one folder inside it that has the manifest. Windows' "Extract All" on a zip that has a
+/// top folder of its own leaves the extension one level down.
+pub fn manifest_dir(dir: &Path) -> Option<PathBuf> {
+    if dir.join("manifest.json").is_file() {
+        return Some(dir.to_path_buf());
+    }
+    std::fs::read_dir(dir).ok()?.filter_map(Result::ok).map(|e| e.path()).find(|p| p.join("manifest.json").is_file())
+}
+
 /// The display name from an unpacked extension's manifest, resolving `__MSG_name__` against the
 /// bundled locale files. Falls back to the folder name.
 pub fn manifest_name(dir: &Path) -> Option<String> {
@@ -267,6 +277,19 @@ mod tests {
         assert_eq!(unpack(&second, &dir).unwrap(), 1);
         assert!(!dir.join("js").exists(), "the old files are gone");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn finds_an_extension_extracted_one_level_down() {
+        let dir = scratch("nested");
+        let inner = dir.join("uBOLite.chromium");
+        std::fs::create_dir_all(&inner).unwrap();
+        assert_eq!(manifest_dir(&dir), None, "no manifest anywhere yet");
+        std::fs::write(inner.join("manifest.json"), "{}").unwrap();
+        assert_eq!(manifest_dir(&dir), Some(inner.clone()));
+        std::fs::write(dir.join("manifest.json"), "{}").unwrap();
+        assert_eq!(manifest_dir(&dir), Some(dir.clone()), "the folder's own manifest wins");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -23,6 +23,8 @@ export struct TabData {
     // Playing sound (also while muted), and muted by the user.
     audible: bool,
     muted: bool,
+    // What the tab shows: a web page, the new tab page, or one of the internal pages.
+    page: Page,
 }
 
 export struct LinkData {
@@ -77,41 +79,42 @@ export struct SettingsData {
     mcp-enabled: bool,
     mcp-host: string,
     mcp-port: int,
+    dark-mode: bool,
 }
 
 global Theme {
-    // While a private tab is in front, everything goes dark, like Chrome's incognito window
-    // (dark values sampled off Chrome 155's).
-    in-out property <bool> incognito;
-    out property <color> frame: incognito ? #2b2b2b : #dde3e9;
-    out property <color> surface: incognito ? #3c3c3c : #ffffff;
+    // Dark mode, and while a private tab is in front, like Chrome's incognito window (dark values
+    // sampled off Chrome 155's).
+    in-out property <bool> dark;
+    out property <color> frame: dark ? #2b2b2b : #dde3e9;
+    out property <color> surface: dark ? #3c3c3c : #ffffff;
     // Behind the cards of internal pages.
-    out property <color> page: incognito ? #282828 : #f3f6fb;
-    out property <color> field: incognito ? #282828 : #edf2fa;
-    out property <color> field-hover: incognito ? #323232 : #e2e8f1;
-    out property <color> text: incognito ? #e3e3e3 : #1f1f1f;
-    out property <color> icon: incognito ? #c7c7c7 : #474747;
-    out property <color> dim: incognito ? #ababab : #5e5e5e;
-    out property <color> disabled: incognito ? #6b6b6b : #b0b3b6;
-    out property <color> hover: incognito ? #ffffff1a : #1f1f1f14;
-    out property <color> pressed: incognito ? #ffffff29 : #1f1f1f24;
-    out property <color> row-hover: incognito ? #ffffff0f : #1f1f1f0a;
-    out property <color> border: incognito ? #444746 : #e1e3e1;
-    out property <color> outline: incognito ? #5e5e5e : #c4c7c5;
-    out property <color> separator: incognito ? #5e5e5e : #c7c7c7;
+    out property <color> page: dark ? #282828 : #f3f6fb;
+    out property <color> field: dark ? #282828 : #edf2fa;
+    out property <color> field-hover: dark ? #323232 : #e2e8f1;
+    out property <color> text: dark ? #e3e3e3 : #1f1f1f;
+    out property <color> icon: dark ? #c7c7c7 : #474747;
+    out property <color> dim: dark ? #ababab : #5e5e5e;
+    out property <color> disabled: dark ? #6b6b6b : #b0b3b6;
+    out property <color> hover: dark ? #ffffff1a : #1f1f1f14;
+    out property <color> pressed: dark ? #ffffff29 : #1f1f1f24;
+    out property <color> row-hover: dark ? #ffffff0f : #1f1f1f0a;
+    out property <color> border: dark ? #444746 : #e1e3e1;
+    out property <color> outline: dark ? #5e5e5e : #c4c7c5;
+    out property <color> separator: dark ? #5e5e5e : #c7c7c7;
     // A hovered background tab, as a solid color so its title fade can blend into it.
-    out property <color> tab-hover: incognito ? #333333 : #ecf0f3;
+    out property <color> tab-hover: dark ? #333333 : #ecf0f3;
     out property <color> private-tab: #46465a;
     out property <color> private-tab-hover: #55556a;
-    out property <color> accent: incognito ? #a8c7fa : #0b57d0;
-    out property <color> accent-hover: incognito ? #bcd3fb : #1a62d6;
-    out property <color> accent-pressed: incognito ? #d3e3fd : #0a4cb8;
+    out property <color> accent: dark ? #a8c7fa : #0b57d0;
+    out property <color> accent-hover: dark ? #bcd3fb : #1a62d6;
+    out property <color> accent-pressed: dark ? #d3e3fd : #0a4cb8;
     // Text on an accent-filled button.
-    out property <color> on-accent: incognito ? #062e6f : #ffffff;
-    out property <color> danger: incognito ? #f2b8b5 : #c42b1c;
-    out property <color> selection: incognito ? #4a6290 : #a8c7fa;
+    out property <color> on-accent: dark ? #062e6f : #ffffff;
+    out property <color> danger: dark ? #f2b8b5 : #c42b1c;
+    out property <color> selection: dark ? #4a6290 : #a8c7fa;
     // The disc behind a new-tab tile's icon.
-    out property <color> tile: incognito ? #4a4a4a : #f1f3f4;
+    out property <color> tile: dark ? #4a4a4a : #f1f3f4;
 }
 
 global Icons {
@@ -259,7 +262,12 @@ component TabItem inherits Rectangle {
     // The divider at the right end of the slot (hidden next to the active or hovered tab).
     in property <bool> separator;
     out property <bool> hovered: touch.has-hover;
-    callback clicked;
+    // The left button went down / moved / came up; x is the pointer's, in window coordinates, so
+    // it does not shift while the tab itself is being dragged along.
+    callback pressed(length);
+    callback dragged(length);
+    // The button came up (true), or the press was lost and the drag is off (false).
+    callback released(bool);
     callback close;
     callback context-menu;
     callback toggle-mute;
@@ -267,9 +275,15 @@ component TabItem inherits Rectangle {
     property <bool> sound: root.tab.audible || root.tab.muted;
     // A compact tab has no room beside its icon, so the speaker takes the icon's place, as in Chrome.
     property <bool> sound-in-icon: root.compact && root.sound && !root.tab.loading;
+    // Internal pages show their page's glyph instead of a site icon.
+    property <string> page-icon: root.tab.page == Page.settings ? Icons.tune
+        : root.tab.page == Page.extensions ? Icons.puzzle
+        : root.tab.page == Page.history ? Icons.history
+        : root.tab.page == Page.bookmarks ? Icons.bookmarks
+        : root.tab.page == Page.import ? Icons.import : "";
 
     // A private tab is dark while in the background; once active it joins the toolbar, which
-    // turns dark with it (Theme.incognito).
+    // turns dark with it (Theme.dark).
     property <bool> dark: root.tab.private && !root.active;
     // The solid color behind the title, for its fade-out.
     property <color> fill: root.active ? Theme.surface
@@ -312,16 +326,25 @@ component TabItem inherits Rectangle {
         background: Theme.separator;
     }
 
+    // Like Chrome, a tab is selected as the button goes down, so it can be dragged right away.
     touch := TouchArea {
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.pressed(self.absolute-position.x + self.mouse-x);
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                root.released(true);
+            } else if (e.kind == PointerEventKind.cancel) {
+                root.released(false);
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
                 root.close();
             } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
                 root.context-menu();
             }
         }
-        clicked => {
-            root.clicked();
+        moved => {
+            if (self.pressed) {
+                root.dragged(self.absolute-position.x + self.mouse-x);
+            }
         }
     }
 
@@ -362,14 +385,26 @@ component TabItem inherits Rectangle {
                 stroke-line-cap: round;
                 stroke-line-join: round;
             }
-            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.tab.favicon.width > 0: Image {
+            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.page-icon != "": Path {
+                y: (parent.height - self.height) / 2;
+                width: 16px;
+                height: 16px;
+                viewbox-width: 24;
+                viewbox-height: 24;
+                commands: root.page-icon;
+                stroke: Theme.icon;
+                stroke-width: 1.5px;
+                stroke-line-cap: round;
+                stroke-line-join: round;
+            }
+            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.page-icon == "" && root.tab.favicon.width > 0: Image {
                 y: (parent.height - self.height) / 2;
                 source: root.tab.favicon;
                 width: 16px;
                 height: 16px;
                 image-fit: contain;
             }
-            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.tab.favicon.width == 0: Path {
+            if !root.tab.loading && !root.sound-in-icon && !root.tab.private && root.page-icon == "" && root.tab.favicon.width == 0: Path {
                 y: (parent.height - self.height) / 2;
                 width: 16px;
                 height: 16px;
@@ -752,9 +787,10 @@ component Toggle inherits Rectangle {
     width: 36px;
     height: 20px;
     border-radius: 10px;
-    background: root.checked ? Theme.accent : #e3e3e3;
+    // Material 3's switch colors, light and dark.
+    background: root.checked ? Theme.accent : Theme.dark ? #36343b : #e3e3e3;
     border-width: root.checked ? 0px : 1.5px;
-    border-color: #747775;
+    border-color: Theme.dark ? #938f99 : #747775;
 
     Rectangle {
         width: root.checked ? 14px : 10px;
@@ -762,7 +798,7 @@ component Toggle inherits Rectangle {
         border-radius: self.width / 2;
         x: root.checked ? root.width - self.width - 3px : 5px;
         y: (root.height - self.height) / 2;
-        background: root.checked ? #ffffff : #747775;
+        background: root.checked ? Theme.on-accent : Theme.dark ? #938f99 : #747775;
     }
 
     TouchArea {
@@ -1047,6 +1083,8 @@ export component AppWindow inherits Window {
     callback content-geometry-changed();
     callback command(string);
     callback select-tab(int);
+    // A tab was dragged from one slot to another; Rust answers with end-tab-drag().
+    callback move-tab(int, int);
     callback close-tab(int);
     callback tab-context-menu(int);
     callback toggle-tab-mute(int);
@@ -1095,6 +1133,11 @@ export component AppWindow inherits Window {
     callback toggle-devtools();
     callback devtools-dock-menu();
 
+    public function end-tab-drag() {
+        tab-strip.drag-index = -1;
+        tab-strip.drag-dx = 0;
+    }
+
     public function focus-address() {
         address-input.focus();
         address-input.select-all();
@@ -1142,11 +1185,11 @@ export component AppWindow inherits Window {
         Palette.color-scheme = ColorScheme.light;
     }
 
-    property <bool> incognito: root.tabs[root.active-tab].private;
-    changed incognito => {
-        Theme.incognito = self.incognito;
+    property <bool> dark: root.settings.dark-mode || root.tabs[root.active-tab].private;
+    changed dark => {
+        Theme.dark = self.dark;
         // The std widgets (fields, checkboxes, scrollbars) of internal pages follow along.
-        Palette.color-scheme = self.incognito ? ColorScheme.dark : ColorScheme.light;
+        Palette.color-scheme = self.dark ? ColorScheme.dark : ColorScheme.light;
     }
 
     keys := FocusScope {
@@ -1166,31 +1209,6 @@ export component AppWindow inherits Window {
             if (e.text == Key.Escape && (root.suggestions-open || address-input.has-focus)) {
                 root.close-suggestions();
                 return accept;
-            }
-            // Clipboard shortcuts for the address bar. Slint's built-in text editing only matches
-            // lowercase letters, so with Caps Lock on (text comes through uppercase) copy/paste/cut
-            // would silently do nothing. Handle both cases here explicitly.
-            if (address-input.has-focus && e.modifiers.control && !e.modifiers.alt && !e.modifiers.shift) {
-                if (e.text == "c" || e.text == "C") {
-                    address-input.copy();
-                    return accept;
-                }
-                if (e.text == "x" || e.text == "X") {
-                    address-input.cut();
-                    return accept;
-                }
-                if (e.text == "v" || e.text == "V") {
-                    address-input.paste();
-                    return accept;
-                }
-                if (e.text == "a" || e.text == "A") {
-                    address-input.select-all();
-                    return accept;
-                }
-                if (e.text == "z" || e.text == "Z") {
-                    address-input.undo();
-                    return accept;
-                }
             }
             if (e.modifiers.control && e.modifiers.shift && (e.text == "i" || e.text == "I")) {
                 root.toggle-devtools();
@@ -1337,8 +1355,37 @@ export component AppWindow inherits Window {
                     return i < root.pinned-count ? self.pin-w : self.normal-w;
                 }
 
+                // Dragging a tab: it follows the pointer within its group (pinned or not) and the
+                // tabs it passes slide over by a slot. Rust reorders the tabs on release and then
+                // calls end-tab-drag(), so the new order and the drop show in the same frame.
+                property <int> drag-index: -1;
+                property <length> drag-start;
+                property <length> drag-dx;
+                // A few pixels of slack, so a click that wobbles stays a click.
+                property <bool> dragging: self.drag-index >= 0 && Math.abs(self.drag-dx) > 6px;
+                property <int> group-first: self.drag-index < root.pinned-count ? 0 : root.pinned-count;
+                property <int> group-last: self.drag-index < root.pinned-count ? root.pinned-count - 1 : root.tabs.length - 1;
+                // Slots within a group are all the same width.
+                property <int> drop-index: clamp(self.drag-index + Math.round(self.drag-dx / self.tab-w(self.drag-index)), self.group-first, self.group-last);
+
+                function slot-x(i: int) -> length {
+                    if (self.dragging) {
+                        if (i == self.drag-index) {
+                            return clamp(self.tab-x(i) + self.drag-dx, self.tab-x(self.group-first), self.tab-x(self.group-last));
+                        }
+                        if (self.drag-index < i && i <= self.drop-index) {
+                            return self.tab-x(i - 1);
+                        }
+                        if (self.drop-index <= i && i < self.drag-index) {
+                            return self.tab-x(i + 1);
+                        }
+                    }
+                    return self.tab-x(i);
+                }
+
                 for t[i] in root.tabs: TabItem {
-                    x: tab-strip.tab-x(i) + 3px;
+                    x: tab-strip.slot-x(i) + 3px;
+                    z: i == tab-strip.drag-index ? 1 : 0;
                     y: 6px;
                     width: tab-strip.tab-w(i) - 6px;
                     height: parent.height - 6px;
@@ -1354,8 +1401,23 @@ export component AppWindow inherits Window {
                             tab-strip.hover-index = -1;
                         }
                     }
-                    clicked => {
+                    pressed(px) => {
+                        tab-strip.drag-index = i;
+                        tab-strip.drag-start = px;
+                        tab-strip.drag-dx = 0;
                         root.select-tab(i);
+                    }
+                    dragged(px) => {
+                        if (tab-strip.drag-index == i) {
+                            tab-strip.drag-dx = px - tab-strip.drag-start;
+                        }
+                    }
+                    released(commit) => {
+                        if (commit && tab-strip.dragging && tab-strip.drop-index != i) {
+                            root.move-tab(i, tab-strip.drop-index);
+                        } else {
+                            root.end-tab-drag();
+                        }
                     }
                     close => {
                         root.close-tab(i);
@@ -2219,6 +2281,7 @@ export component AppWindow inherits Window {
                             mcp-enabled: mcp.checked,
                             mcp-host: mcp-host.text,
                             mcp-port: mcp-port.value,
+                            dark-mode: dark-toggle.checked,
                         });
                     }
                     function save-soon() {
@@ -2242,6 +2305,25 @@ export component AppWindow inherits Window {
                             vertical: start;
                             PageHeader {
                                 title: "設定";
+                            }
+
+                            SectionTitle {
+                                text: "外觀";
+                            }
+
+                            Card {
+                                VerticalLayout {
+                                    SettingRow {
+                                        label: "深色模式";
+                                        sub: "瀏覽器介面變成深色；有深色版面的網站也會跟著換";
+                                        dark-toggle := Toggle {
+                                            checked: root.settings.dark-mode;
+                                            toggled => {
+                                                settings-page.save();
+                                            }
+                                        }
+                                    }
+                                }
                             }
 
                             SectionTitle {
@@ -2373,41 +2455,15 @@ export component AppWindow inherits Window {
                             }
 
                             SectionTitle {
-                                text: "系統";
+                                text: "MCP 服務（讓 LLM 操作瀏覽器）";
                             }
 
                             Card {
                                 VerticalLayout {
                                     SettingRow {
-                                        label: "停用 GPU";
-                                        sub: "VDI 沒有顯示卡時建議開啟；重新啟動後生效";
-                                        gpu := Toggle {
-                                            checked: root.settings.disable-gpu;
-                                            toggled => {
-                                                settings-page.save();
-                                            }
-                                        }
-                                    }
-
-                                    Divider { }
-
-                                    SettingRow {
-                                        label: "開發人員工具停駐在右側";
-                                        sub: "預設在下方；也可以在分隔線上按右鍵切換";
-                                        devtools-dock := Toggle {
-                                            checked: root.settings.devtools-dock-right;
-                                            toggled => {
-                                                settings-page.save();
-                                            }
-                                        }
-                                    }
-
-                                    Divider { }
-
-                                    SettingRow {
                                         label: "開啟 MCP 服務";
                                         sub: root.mcp-url != ""
-                                            ? "讓 Claude 等 LLM 操作這個瀏覽器。網址每次啟動都會換，也會寫進資料夾的 mcp-url.txt：\n" + root.mcp-url
+                                            ? "Claude 等 LLM 用下面的網址連進來操作這個瀏覽器。網址每次啟動都會換，也會寫進資料夾的 mcp-url.txt"
                                             : root.settings.mcp-enabled
                                             ? "讓 Claude 等 LLM 操作這個瀏覽器。會在下次啟動時開啟。"
                                             : "讓 Claude 等 LLM 操作這個瀏覽器；重新啟動後生效";
@@ -2415,6 +2471,33 @@ export component AppWindow inherits Window {
                                             checked: root.settings.mcp-enabled;
                                             toggled => {
                                                 settings-page.save();
+                                            }
+                                        }
+                                    }
+
+                                    if root.mcp-url != "": VerticalLayout {
+                                        Divider { }
+                                        HorizontalLayout {
+                                            padding-left: 20px;
+                                            padding-right: 20px;
+                                            padding-top: 12px;
+                                            padding-bottom: 12px;
+                                            spacing: 8px;
+                                            mcp-url-field := LineEdit {
+                                                horizontal-stretch: 1;
+                                                read-only: true;
+                                                text: root.mcp-url;
+                                            }
+
+                                            VerticalLayout {
+                                                alignment: center;
+                                                PillButton {
+                                                    text: "複製網址";
+                                                    clicked => {
+                                                        mcp-url-field.select-all();
+                                                        mcp-url-field.copy();
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -2448,6 +2531,38 @@ export component AppWindow inherits Window {
                                                 edited => {
                                                     settings-page.save-soon();
                                                 }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            SectionTitle {
+                                text: "系統";
+                            }
+
+                            Card {
+                                VerticalLayout {
+                                    SettingRow {
+                                        label: "停用 GPU";
+                                        sub: "VDI 沒有顯示卡時建議開啟；重新啟動後生效";
+                                        gpu := Toggle {
+                                            checked: root.settings.disable-gpu;
+                                            toggled => {
+                                                settings-page.save();
+                                            }
+                                        }
+                                    }
+
+                                    Divider { }
+
+                                    SettingRow {
+                                        label: "開發人員工具停駐在右側";
+                                        sub: "預設在下方；也可以在分隔線上按右鍵切換";
+                                        devtools-dock := Toggle {
+                                            checked: root.settings.devtools-dock-right;
+                                            toggled => {
+                                                settings-page.save();
                                             }
                                         }
                                     }

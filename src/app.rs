@@ -36,6 +36,26 @@ slint::include_modules!();
 
 const WEBVIEW2_DOWNLOAD: &str = "https://go.microsoft.com/fwlink/p/?LinkId=2124703";
 
+/// Internal pages are tabs whose URL names the page, so they open, switch and close like any other
+/// tab (Chrome's chrome:// pages): page, URL, tab title.
+const INTERNAL_PAGES: [(Page, &str, &str); 5] = [
+    (Page::Bookmarks, "litebrowser://bookmarks", "書籤"),
+    (Page::History, "litebrowser://history", "歷史紀錄"),
+    (Page::Extensions, "litebrowser://extensions", "擴充功能"),
+    (Page::Settings, "litebrowser://settings", "設定"),
+    (Page::Import, "litebrowser://import", "從其他瀏覽器匯入"),
+];
+
+/// What a tab with this URL shows.
+fn page_of(url: &str) -> Page {
+    if url.is_empty() {
+        return Page::NewTab;
+    }
+    INTERNAL_PAGES.iter().find(|p| p.1 == url).map_or(Page::Web, |p| p.0)
+}
+
+const NO_EXTENSION_PROFILE: &str = "擴充功能還不能用：WebView2 尚未就緒，或 WebView2 Runtime 版本太舊。請稍候再試。";
+
 // ---------------------------------------------------------------------------------------------
 // Event queue
 
@@ -52,6 +72,8 @@ pub enum Event {
     ExtensionChanged(Result<(), String>),
     /// The docked DevTools controller finished being created.
     DevtoolsViewCreated(Result<ICoreWebView2Controller, String>),
+    /// The hidden WebView that gives the extensions page a profile finished being created.
+    ExtensionHostCreated(Result<ICoreWebView2Controller, String>),
     /// Each renderer PID with the ids of the frames it runs.
     RendererFrames(Vec<(u32, Vec<u32>)>),
     Tick,
@@ -60,6 +82,8 @@ pub enum Event {
 pub enum UiEvent {
     Command(Shortcut),
     SelectTab(usize),
+    /// A tab was dragged from one slot to another.
+    MoveTab(usize, usize),
     CloseTab(usize),
     Navigate(String),
     OpenUrl(String),
@@ -203,6 +227,12 @@ pub fn run() {
         }
     };
     wire_callbacks(&ui);
+    // Alt+F4, or "close window" from the taskbar or Task Manager. Our own ways out (the close
+    // button, 結束, the last tab) log themselves in `App::quit`.
+    ui.window().on_close_requested(|| {
+        log!("quitting: the window was closed by the system (Alt+F4, taskbar or Task Manager)");
+        slint::CloseRequestResponse::HideWindow
+    });
 
     let app = App::new(ui.clone_strong(), paths, launch_url);
     APP.with(|cell| *cell.borrow_mut() = Some(app));
@@ -373,6 +403,7 @@ fn wire_callbacks(ui: &AppWindow) {
         }
     });
     ui.on_select_tab(|i| ui_post(UiEvent::SelectTab(i.max(0) as usize)));
+    ui.on_move_tab(|from, to| ui_post(UiEvent::MoveTab(from.max(0) as usize, to.max(0) as usize)));
     ui.on_close_tab(|i| ui_post(UiEvent::CloseTab(i.max(0) as usize)));
     ui.on_tab_context_menu(|i| ui_post(UiEvent::TabContextMenu(i.max(0) as usize)));
     ui.on_toggle_tab_mute(|i| ui_post(UiEvent::ToggleMute(i.max(0) as usize)));
@@ -558,7 +589,6 @@ struct App {
     bookmarks: Bookmarks,
     history: History,
     zoom: ZoomLevels,
-    page: Page,
     suggestions_open: bool,
     address_focused: bool,
     /// The user typed into the address bar since it last showed the tab's URL.
@@ -591,6 +621,12 @@ struct App {
     devtools_view: Option<WebView>,
     devtools_creating: bool,
     pending_devtools_url: Option<String>,
+    /// The tab the docked DevTools inspect.
+    devtools_tab: TabId,
+    /// A hidden WebView for the extensions page while no tab has one: extensions live in the
+    /// WebView2 profile, and only a WebView leads to it.
+    extension_host: Option<WebView>,
+    extension_host_creating: bool,
     launch_url: Option<String>,
     /// The MCP endpoint URL, when the server is running.
     mcp_url: String,
@@ -646,7 +682,6 @@ impl App {
             active: 0,
             next_id: 1,
             closed: Vec::new(),
-            page: Page::NewTab,
             suggestions_open: false,
             address_focused: false,
             address_edited: false,
@@ -670,6 +705,9 @@ impl App {
             devtools_view: None,
             devtools_creating: false,
             pending_devtools_url: None,
+            devtools_tab: 0,
+            extension_host: None,
+            extension_host_creating: false,
             launch_url,
             mcp_url: String::new(),
         };
@@ -697,14 +735,12 @@ impl App {
             app.push_tab(String::new(), String::new());
         }
         app.reorder_pinned_first();
-        app.active = session.active.min(app.tabs.len() - 1);
-        app.page = if app.tabs[app.active].url.is_empty() { Page::NewTab } else { Page::Web };
+        let active = session.active.min(app.tabs.len() - 1);
         app.ui.set_settings(app.settings_data());
         app.ui.set_devtools_right(app.cfg.devtools_dock_right);
         app.ui.set_window_maximized(app.ui.window().is_maximized());
         app.refresh_bookmarks();
-        app.refresh_top_sites();
-        app.refresh_all();
+        app.activate(active);
         app
     }
 
@@ -729,6 +765,7 @@ impl App {
                 self.request_extension_list();
             }
             Event::DevtoolsViewCreated(result) => self.on_devtools_view_created(result),
+            Event::ExtensionHostCreated(result) => self.on_extension_host_created(result),
             Event::RendererFrames(renderers) => self.on_renderer_frames(renderers),
             Event::Tick => self.tick(),
         }
@@ -854,6 +891,11 @@ impl App {
         match event {
             UiEvent::Command(s) => self.run_shortcut(s),
             UiEvent::SelectTab(i) => self.activate(i),
+            UiEvent::MoveTab(from, to) => {
+                self.move_tab(from, to);
+                // The strip kept the dragged look until the rows were in their new order.
+                self.ui.invoke_end_tab_drag();
+            }
             UiEvent::CloseTab(i) => self.close_tab(i),
             UiEvent::TabContextMenu(i) => self.tab_context_menu(i),
             UiEvent::ToggleMute(i) => self.toggle_mute(i),
@@ -894,7 +936,7 @@ impl App {
                 self.address_edited = false;
                 self.set_suggestions_open(false);
                 self.sync_address();
-                if self.page == Page::Web {
+                if self.page() == Page::Web {
                     self.with_active_view(WebView::focus);
                 }
             }
@@ -946,7 +988,7 @@ impl App {
                 self.ui.window().set_maximized(maximized);
                 self.ui.set_window_maximized(maximized);
             }
-            UiEvent::CloseWindow => self.quit(),
+            UiEvent::CloseWindow => self.quit("the window's close button"),
             UiEvent::RefreshImport => self.refresh_import(),
             UiEvent::ImportRun { bookmarks, history } => self.run_import(bookmarks, history),
             UiEvent::ImportPasswordsCsv => self.import_passwords_csv(),
@@ -1006,10 +1048,6 @@ impl App {
             Shortcut::ShowBookmarks => self.show_page(Page::Bookmarks),
             Shortcut::ShowHistory => self.show_page(Page::History),
             Shortcut::ShowDownloads => {
-                if self.page != Page::Web {
-                    let active = self.active;
-                    self.activate(active);
-                }
                 let opened = self.tabs[self.active].view.as_ref().is_some_and(WebView::open_downloads);
                 if !opened {
                     self.set_status("下載清單要在網頁分頁中開啟");
@@ -1032,7 +1070,7 @@ impl App {
     }
 
     fn reload_active(&mut self) {
-        match self.page {
+        match self.page() {
             Page::Web => {
                 let tab = &self.tabs[self.active];
                 if tab.view.is_some() {
@@ -1094,6 +1132,11 @@ impl App {
         self.tabs.iter().position(|t| t.id == id)
     }
 
+    /// What the active tab shows.
+    fn page(&self) -> Page {
+        self.tabs.get(self.active).map_or(Page::NewTab, |t| page_of(&t.url))
+    }
+
     fn activate(&mut self, idx: usize) {
         if idx >= self.tabs.len() {
             return;
@@ -1110,11 +1153,16 @@ impl App {
                 self.apply_fullscreen();
             }
         }
+        let page = self.page();
+        // Docked DevTools inspect one tab's page; left open they would show it over another tab.
+        let inspected = self.tabs[idx].id == self.devtools_tab && page == Page::Web;
+        if !inspected && (self.devtools_view.is_some() || self.devtools_creating) {
+            self.close_devtools();
+        }
         self.suggestions_open = false;
         self.address_edited = false;
         let tab = &mut self.tabs[idx];
         tab.last_active_ms = now;
-        self.page = if tab.url.is_empty() { Page::NewTab } else { Page::Web };
         if let Some(view) = &tab.view {
             if tab.suspended {
                 view.resume();
@@ -1122,13 +1170,47 @@ impl App {
             }
             view.set_low_memory(false);
         }
+        if page == Page::Extensions {
+            self.ensure_extension_host();
+        } else {
+            self.extension_host = None;
+        }
+        // An internal page loads its data as it comes on screen, when its fields start out empty.
+        if page != self.ui.get_page() {
+            self.ui.set_page(page);
+            match page {
+                Page::Bookmarks => self.refresh_bookmarks(),
+                Page::History => {
+                    self.history_query.clear();
+                    self.refresh_history();
+                }
+                Page::Extensions => {
+                    self.ui.set_extensions_message(SharedString::new());
+                    self.request_extension_list();
+                }
+                Page::Settings => self.ui.set_settings(self.settings_data()),
+                Page::Import => {
+                    if self.import_profiles.is_empty() {
+                        self.refresh_import();
+                    }
+                }
+                Page::NewTab | Page::Web => {}
+            }
+        }
         self.ensure_view(idx);
         self.layout_views();
-        if self.page == Page::NewTab {
-            self.refresh_top_sites();
-            self.focus_address();
-        } else {
-            self.with_active_view(WebView::focus);
+        match page {
+            Page::NewTab => {
+                self.refresh_top_sites();
+                self.focus_address();
+            }
+            Page::Web => self.with_active_view(WebView::focus),
+            // Keys belong to the page on screen, not to a WebView hidden behind it.
+            _ => {
+                if let Some(hwnd) = self.hwnd {
+                    win::focus_main_window(hwnd);
+                }
+            }
         }
         self.session_dirty = true;
         self.refresh_all();
@@ -1143,8 +1225,7 @@ impl App {
         // finished with those tabs, so the next start is blank; closing the window with X restores.
         if self.tabs.len() == 1 {
             self.forget_session = true;
-            self.save_all();
-            slint::quit_event_loop().ok();
+            self.quit("the last tab was closed");
             return;
         }
         let tab = self.tabs.remove(idx);
@@ -1169,38 +1250,46 @@ impl App {
     }
 
     fn navigate_active(&mut self, url: String) {
-        self.suggestions_open = false;
-        self.address_edited = false;
-        self.page = Page::Web;
         let idx = self.active;
+        self.load(idx, url);
+        self.activate(idx);
+    }
+
+    /// Opens a URL from the bookmarks bar, a suggestion or an internal page, in the active tab like
+    /// Chrome's history and bookmarks pages do.
+    fn open_url(&mut self, url: String) {
+        self.navigate_active(url);
+    }
+
+    /// Points a tab at `url`. A web page loads in the tab's WebView; an internal page lets go of it.
+    fn load(&mut self, idx: usize, url: String) {
+        let page = page_of(&url);
         let tab = &mut self.tabs[idx];
-        tab.url = url.clone();
+        // An internal page's title is not the web page's, which brings its own once it loads.
+        if page_of(&tab.url) != Page::Web {
+            tab.title.clear();
+        }
+        tab.url = url;
+        self.session_dirty = true;
+        if page != Page::Web {
+            tab.title = INTERNAL_PAGES.iter().find(|p| p.0 == page).map_or("", |p| p.2).to_string();
+            tab.favicon = Image::default();
+            tab.drop_view();
+            // A WebView still on its way is closed when it arrives (on_view_created).
+            tab.creating = false;
+            return;
+        }
         tab.loading = true;
         match &tab.view {
-            Some(view) => view.navigate(&url),
+            Some(view) => view.navigate(&tab.url),
             None => self.ensure_view(idx),
         }
-        self.layout_views();
-        self.with_active_view(WebView::focus);
-        self.session_dirty = true;
-        self.refresh_all();
     }
 
-    /// Opens a URL from the bookmarks bar, a suggestion or an internal page.
-    fn open_url(&mut self, url: String) {
-        let over_page = matches!(self.page, Page::Bookmarks | Page::History);
-        if over_page && !self.tabs[self.active].url.is_empty() {
-            let idx = self.insert_tab(self.active + 1, url, String::new(), None);
-            self.activate(idx);
-        } else {
-            self.navigate_active(url);
-        }
-    }
-
-    /// Creates the WebView for a tab that has a URL but none yet.
+    /// Creates the WebView for a tab that shows a web page but has none yet.
     fn ensure_view(&mut self, idx: usize) {
         let Some(tab) = self.tabs.get(idx) else { return };
-        if tab.view.is_some() || tab.creating || tab.url.is_empty() {
+        if tab.view.is_some() || tab.creating || page_of(&tab.url) != Page::Web {
             return;
         }
         let id = tab.id;
@@ -1240,8 +1329,8 @@ impl App {
         result: Result<ICoreWebView2Controller, String>,
         new_window: Option<NewWindowRequest>,
     ) {
-        let Some(idx) = self.index_of(id) else {
-            // Tab closed while its WebView was being created.
+        let Some(idx) = self.index_of(id).filter(|&i| page_of(&self.tabs[i].url) == Page::Web) else {
+            // Tab closed, or turned into an internal page, while its WebView was being created.
             if let Ok(controller) = result {
                 unsafe {
                     let _ = controller.Close();
@@ -1267,6 +1356,7 @@ impl App {
                 if self.tabs[idx].muted {
                     view.set_muted(true);
                 }
+                view.set_dark(self.cfg.dark_mode);
                 match new_window {
                     // The page's window.open() gets this WebView, so window.opener keeps working.
                     Some(req) => unsafe {
@@ -1284,7 +1374,7 @@ impl App {
                 self.apply_zoom(idx);
                 self.layout_views();
                 // Focus the page unless the user has started typing a new address meanwhile.
-                if idx == self.active && self.page == Page::Web && !self.address_edited {
+                if idx == self.active && !self.address_edited {
                     self.with_active_view(WebView::focus);
                 }
                 if !self.extensions_synced {
@@ -1305,7 +1395,7 @@ impl App {
     }
 
     fn web_shown(&self) -> bool {
-        self.page == Page::Web && !self.suggestions_open && !self.minimized
+        self.page() == Page::Web && !self.suggestions_open && !self.minimized
     }
 
     /// Shows the active tab's WebView over the page area (or hides it when a Slint page or the
@@ -1542,10 +1632,13 @@ impl App {
                 }
             }
             EngineEvent::NewWindow(req) => self.on_new_window(idx, req),
-            EngineEvent::CloseRequested => self.close_tab(idx),
+            EngineEvent::CloseRequested => {
+                log!("tab {id}: the page closed itself (window.close)");
+                self.close_tab(idx);
+            }
             EngineEvent::RendererGone => {
                 self.tabs[idx].drop_view();
-                if is_active && self.page == Page::Web {
+                if is_active {
                     self.set_status("分頁的網頁程序結束了，已重新載入");
                     self.ensure_view(idx);
                 }
@@ -1613,7 +1706,7 @@ impl App {
                     if self.bookmarks.items().iter().any(|b| url_input::host_of(&b.url) == host) {
                         self.refresh_bookmarks();
                     }
-                    if matches!(self.page, Page::History | Page::NewTab) {
+                    if matches!(self.page(), Page::History | Page::NewTab) {
                         self.refresh_history();
                         self.refresh_top_sites();
                     }
@@ -1652,6 +1745,8 @@ impl App {
         win::set_active_controller(None);
         self.env = None;
         self.extensions_synced = false;
+        self.extension_host = None;
+        self.extension_host_creating = false;
         self.set_status("WebView2 已重新啟動");
         self.create_environment();
     }
@@ -1722,36 +1817,20 @@ impl App {
         self.ui.set_address(url.into());
     }
 
+    /// Switches to the internal page's tab, opening one if there is none. A blank new tab turns
+    /// into it rather than staying behind empty, like Chrome.
     fn show_page(&mut self, page: Page) {
-        // Clicking the button of the page that is already open returns to the web page.
-        if page == self.page && page != Page::Web {
-            let active = self.active;
-            self.activate(active);
-            return;
-        }
-        self.page = page;
-        self.suggestions_open = false;
-        match page {
-            Page::Bookmarks => self.refresh_bookmarks(),
-            Page::History => {
-                self.history_query.clear();
-                self.refresh_history();
+        let Some(&(_, url, _)) = INTERNAL_PAGES.iter().find(|p| p.0 == page) else { return };
+        let idx = match self.tabs.iter().position(|t| t.url == url) {
+            Some(idx) => idx,
+            None => {
+                let blank = self.tabs[self.active].url.is_empty() && !self.tabs[self.active].private;
+                let idx = if blank { self.active } else { self.push_tab(String::new(), String::new()) };
+                self.load(idx, url.to_string());
+                idx
             }
-            Page::Extensions => {
-                self.ui.set_extensions_message(SharedString::new());
-                self.request_extension_list();
-            }
-            Page::Settings => self.ui.set_settings(self.settings_data()),
-            Page::Import => {
-                if self.import_profiles.is_empty() {
-                    self.refresh_import();
-                }
-            }
-            Page::NewTab => self.refresh_top_sites(),
-            Page::Web => {}
-        }
-        self.layout_views();
-        self.refresh_all();
+        };
+        self.activate(idx);
     }
 
     fn settings_data(&self) -> SettingsData {
@@ -1769,6 +1848,7 @@ impl App {
             mcp_enabled: self.cfg.mcp_enabled,
             mcp_host: self.cfg.mcp_host.clone().into(),
             mcp_port: self.cfg.mcp_port as i32,
+            dark_mode: self.cfg.dark_mode,
         }
     }
 
@@ -1788,6 +1868,7 @@ impl App {
             mcp_enabled: s.mcp_enabled,
             mcp_host: s.mcp_host.to_string(),
             mcp_port: s.mcp_port.clamp(0, u16::MAX as i32) as u16,
+            dark_mode: s.dark_mode,
             ..old.clone()
         }
         .sanitized();
@@ -1795,6 +1876,11 @@ impl App {
         self.ui.set_settings(self.settings_data());
         self.ui.set_devtools_right(self.cfg.devtools_dock_right);
         self.layout_views();
+        if old.dark_mode != self.cfg.dark_mode {
+            for view in self.tabs.iter().filter_map(|t| t.view.as_ref()) {
+                view.set_dark(self.cfg.dark_mode);
+            }
+        }
         let needs_restart = old.disable_gpu != self.cfg.disable_gpu
             || old.adblock != self.cfg.adblock
             || old.mcp_enabled != self.cfg.mcp_enabled
@@ -1812,13 +1898,47 @@ impl App {
     // Extensions
 
     fn any_profile(&self) -> Option<webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Profile7> {
-        self.tabs.iter().filter_map(|t| t.view.as_ref()).find_map(WebView::profile)
+        self.tabs.iter().filter_map(|t| t.view.as_ref()).chain(self.extension_host.as_ref()).find_map(WebView::profile)
+    }
+
+    /// Gives the extensions page a hidden WebView of its own when no tab has one (a fresh start,
+    /// only the new tab page open), so extensions can be listed and installed right away.
+    fn ensure_extension_host(&mut self) {
+        if self.extension_host.is_some() || self.extension_host_creating || self.any_profile().is_some() {
+            return;
+        }
+        let (Some(env), Some(hwnd)) = (self.env.clone(), self.hwnd) else { return };
+        match webview::create_controller(&env, hwnd, false, |result| post(Event::ExtensionHostCreated(result))) {
+            Ok(()) => self.extension_host_creating = true,
+            Err(e) => log!("extension host WebView failed: {e}"),
+        }
+    }
+
+    fn on_extension_host_created(&mut self, result: Result<ICoreWebView2Controller, String>) {
+        self.extension_host_creating = false;
+        let Some(env) = self.env.clone() else { return };
+        // Tab id 0, like DevTools: no tab, so its events go nowhere. It stays hidden and blank.
+        match result.and_then(|c| WebView::attach(c, &env, 0, None).map_err(|e| e.message().to_string())) {
+            // Left the page meanwhile: dropping the view closes it.
+            Ok(_) if self.page() != Page::Extensions => {}
+            Ok(host) => {
+                self.extension_host = Some(host);
+                if !self.extensions_synced {
+                    self.sync_extensions(false);
+                }
+                self.request_extension_list();
+            }
+            Err(e) => {
+                log!("extension host WebView failed: {e}");
+                self.ui.set_extensions_message(format!("無法讀取擴充功能：{e}").into());
+            }
+        }
     }
 
     /// Installs extension folders that were not installed yet (or all of them when `force`).
     fn sync_extensions(&mut self, force: bool) {
         let Some(profile) = self.any_profile() else {
-            self.ui.set_extensions_message("請先開啟任一網頁分頁，才能管理擴充功能。".into());
+            self.ui.set_extensions_message(NO_EXTENSION_PROFILE.into());
             return;
         };
         self.extensions_synced = true;
@@ -1826,8 +1946,7 @@ impl App {
         let mut folders: Vec<(String, PathBuf)> = entries
             .filter_map(Result::ok)
             .map(|e| e.path())
-            .filter(|p| p.join("manifest.json").is_file())
-            .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), p)))
+            .filter_map(|p| Some((p.file_name()?.to_string_lossy().into_owned(), crx::manifest_dir(&p)?)))
             .collect();
         folders.sort();
         let mut started = 0;
@@ -1871,14 +1990,16 @@ impl App {
     }
 
     fn request_extension_list(&mut self) {
-        if self.page != Page::Extensions {
+        if self.page() != Page::Extensions {
             return;
         }
         match self.any_profile() {
             Some(profile) => webview::list_extensions(&profile, |result| post(Event::ExtensionsListed(result))),
+            // The extension host lists them once it is up.
+            None if self.extension_host_creating => {}
             None => {
                 self.models.extensions.set_vec(Vec::new());
-                self.ui.set_extensions_message("請先開啟任一網頁分頁，才能管理擴充功能。".into());
+                self.ui.set_extensions_message(NO_EXTENSION_PROFILE.into());
             }
         }
     }
@@ -1912,7 +2033,7 @@ impl App {
             return;
         };
         if self.any_profile().is_none() {
-            self.ui.set_extensions_message("請先開啟任一網頁分頁，才能安裝擴充功能。".into());
+            self.ui.set_extensions_message(NO_EXTENSION_PROFILE.into());
             return;
         }
         self.extension_installing = true;
@@ -1940,14 +2061,15 @@ impl App {
         };
         let path = self.paths.extensions_dir().join(&folder);
         let name = crx::manifest_name(&path).unwrap_or_else(|| folder.clone());
+        log!("downloaded extension {folder} ({name})");
+        // Dropping the bookkeeping entry means a re-download reinstalls rather than being skipped,
+        // here or, without a profile yet, at the next sync.
+        self.installed_extensions.remove(&folder);
         let Some(profile) = self.any_profile() else {
-            self.ui.set_extensions_message(format!("已下載「{name}」，但需要開啟任一網頁分頁才能安裝。").into());
+            self.ui.set_extensions_message(format!("已下載「{name}」，但 WebView2 尚未就緒，請稍候按「重新載入」。").into());
             return;
         };
-        log!("downloaded extension {folder} ({name})");
         self.ui.set_extensions_message(format!("已下載「{name}」，正在安裝…").into());
-        // Dropping the bookkeeping entry means a re-download reinstalls rather than being skipped.
-        self.installed_extensions.remove(&folder);
         webview::add_extension(&profile, &path, move |result| {
             post(Event::ExtensionInstalled { folder, result });
         });
@@ -1958,7 +2080,7 @@ impl App {
             Some(profile) => {
                 webview::change_extension(&profile, id, change, |result| post(Event::ExtensionChanged(result)))
             }
-            None => self.ui.set_extensions_message("請先開啟任一網頁分頁，才能管理擴充功能。".into()),
+            None => self.ui.set_extensions_message(NO_EXTENSION_PROFILE.into()),
         }
     }
 
@@ -2021,7 +2143,6 @@ impl App {
     // Pushing state to the UI
 
     fn refresh_all(&mut self) {
-        self.ui.set_page(self.page);
         self.ui.set_suggestions_open(self.suggestions_open);
         self.refresh_tabs();
         self.refresh_toolbar();
@@ -2038,23 +2159,35 @@ impl App {
                 title: t.title.clone().into(),
                 url: t.url.clone().into(),
                 loading: t.loading && (t.view.is_some() || t.creating),
-                discarded: t.residency() == Residency::Discarded && !t.url.is_empty(),
+                discarded: t.residency() == Residency::Discarded && page_of(&t.url) == Page::Web,
                 suspended: t.suspended,
                 pinned: t.pinned,
                 favicon: t.favicon.clone(),
                 private: t.private,
                 audible: t.audible,
                 muted: t.muted,
+                page: page_of(&t.url),
             })
             .collect();
-        self.models.tabs.set_vec(data);
+        // Rows are updated in place: resetting the model rebuilds every tab item, and a tab being
+        // dragged would be dropped mid-drag by any title or loading change.
+        if self.models.tabs.row_count() == data.len() {
+            for (i, row) in data.into_iter().enumerate() {
+                if self.models.tabs.row_data(i).as_ref() != Some(&row) {
+                    self.models.tabs.set_row_data(i, row);
+                }
+            }
+        } else {
+            self.models.tabs.set_vec(data);
+            self.ui.invoke_end_tab_drag();
+        }
         self.ui.set_active_tab(self.active as i32);
         self.ui.set_pinned_count(self.tabs.iter().filter(|t| t.pinned).count() as i32);
     }
 
     fn refresh_toolbar(&self) {
         let Some(tab) = self.tabs.get(self.active) else { return };
-        let web = self.page == Page::Web;
+        let web = self.page() == Page::Web;
         self.ui.set_can_go_back(web && tab.view.is_some() && tab.can_back);
         self.ui.set_can_go_forward(web && tab.view.is_some() && tab.can_forward);
         self.ui.set_loading(web && tab.loading);
@@ -2268,11 +2401,8 @@ impl App {
             1 => self.open_url(url),
             2 => self.handle_ui(UiEvent::OpenUrlNewTab(url)),
             3 => {
-                // Reuses the bookmarks page's inline editor; show_page on the open page would
-                // toggle back to the web page instead.
-                if self.page != Page::Bookmarks {
-                    self.show_page(Page::Bookmarks);
-                }
+                // Reuses the bookmarks page's inline editor.
+                self.show_page(Page::Bookmarks);
                 self.ui.set_editing_bookmark(idx as i32);
             }
             4 => self.handle_ui(UiEvent::RemoveBookmark(idx)),
@@ -2493,8 +2623,8 @@ impl App {
     /// Returns the tab's WebView, creating it first if the tab was discarded.
     fn mcp_live_view(&mut self, idx: usize) -> Result<&WebView, String> {
         if self.tabs[idx].view.is_none() {
-            if self.tabs[idx].url.is_empty() {
-                return Err("這個分頁還沒有載入網頁".into());
+            if page_of(&self.tabs[idx].url) != Page::Web {
+                return Err("這個分頁沒有網頁".into());
             }
             self.ensure_view(idx);
             return Err("分頁正在重新載入，請稍候再試一次".into());
@@ -2565,12 +2695,7 @@ impl App {
                         if idx == self.active {
                             self.navigate_active(url.clone());
                         } else {
-                            self.tabs[idx].url = url.clone();
-                            self.tabs[idx].loading = true;
-                            match self.tabs[idx].view.as_ref() {
-                                Some(view) => view.navigate(&url),
-                                None => self.ensure_view(idx),
-                            }
+                            self.load(idx, url.clone());
                             self.refresh_all();
                         }
                         reply(&answer, Ok(serde_json::json!({ "url": url })));
@@ -2647,7 +2772,7 @@ impl App {
             self.close_devtools();
             return;
         }
-        if self.page != Page::Web || self.tabs.get(self.active).map(|t| t.view.is_none()).unwrap_or(true) {
+        if self.page() != Page::Web || self.tabs.get(self.active).map(|t| t.view.is_none()).unwrap_or(true) {
             self.set_status("請先開啟網頁再使用開發人員工具");
             return;
         }
@@ -2669,6 +2794,7 @@ impl App {
             return;
         }
         self.devtools_creating = true;
+        self.devtools_tab = self.tabs[self.active].id;
         self.pending_devtools_url = Some(frontend);
         self.ui.set_devtools_open(true);
     }
@@ -2755,7 +2881,7 @@ impl App {
             10 => self.show_page(Page::Extensions),
             11 => self.show_page(Page::Import),
             12 => self.show_page(Page::Settings),
-            13 => self.quit(),
+            13 => self.quit("結束 in the menu"),
             _ => {}
         }
     }
@@ -2787,8 +2913,10 @@ impl App {
         self.ui.invoke_address_action(action.into());
     }
 
-    /// Same as the old system close button: the session is kept for next time.
-    fn quit(&mut self) {
+    /// Ends the event loop. The session is kept for next time unless `forget_session` is set.
+    /// The reason goes to the log, so a browser that seems to have vanished can be explained.
+    fn quit(&mut self, reason: &str) {
+        log!("quitting: {reason}");
         self.save_all();
         slint::quit_event_loop().ok();
     }
