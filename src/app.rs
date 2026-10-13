@@ -115,6 +115,7 @@ pub enum UiEvent {
     OpenExtensionsFolder,
     ReloadExtensions,
     OpenDataFolder,
+    MakeDefaultBrowser,
     SaveSettings(SettingsData),
     DismissNotice,
     GeometryChanged,
@@ -180,6 +181,12 @@ pub fn run() {
     let paths = Paths::detect();
     logging::init(&paths.log());
     log!("LiteBrowser {} starting; data dir {}", env!("CARGO_PKG_VERSION"), paths.root.display());
+    log!(
+        "pid {}, exe {}, {}",
+        std::process::id(),
+        std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default(),
+        platform::os_version()
+    );
 
     // A URL passed on the command line (e.g. from "open with" or a second launch's forwarding).
     let launch_url = std::env::args().skip(1).find(|a| !a.starts_with('-'));
@@ -437,6 +444,7 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_open_extensions_folder(|| ui_post(UiEvent::OpenExtensionsFolder));
     ui.on_reload_extensions(|| ui_post(UiEvent::ReloadExtensions));
     ui.on_open_data_folder(|| ui_post(UiEvent::OpenDataFolder));
+    ui.on_make_default_browser(|| ui_post(UiEvent::MakeDefaultBrowser));
     ui.on_save_settings(|s| ui_post(UiEvent::SaveSettings(s)));
     ui.on_dismiss_notice(|| ui_post(UiEvent::DismissNotice));
     ui.on_content_geometry_changed(|| ui_post(UiEvent::GeometryChanged));
@@ -551,6 +559,19 @@ impl Tab {
         self.audible = false;
     }
 
+    /// Which site the tab shows, for the log: the host only, and nothing of a private tab's.
+    fn site(&self) -> String {
+        if self.private {
+            "private".into()
+        } else if self.url.is_empty() {
+            "new tab".into()
+        } else if page_of(&self.url) != Page::Web {
+            self.url.clone()
+        } else {
+            url_input::host_of(&self.url).unwrap_or_else(|| self.url.split(':').next().unwrap_or("").to_string())
+        }
+    }
+
     fn residency(&self) -> Residency {
         if self.view.is_none() && !self.creating {
             Residency::Discarded
@@ -633,6 +654,9 @@ struct App {
     launch_url: Option<String>,
     /// The MCP endpoint URL, when the server is running.
     mcp_url: String,
+    last_tick_ms: u64,
+    /// The main window's state as last logged; a new line goes out only when it changes.
+    logged_window_state: String,
 }
 
 impl App {
@@ -714,10 +738,14 @@ impl App {
             extension_host_creating: false,
             launch_url,
             mcp_url: String::new(),
+            last_tick_ms: 0,
+            logged_window_state: String::new(),
         };
         if let Some(e) = cfg_error {
+            log!("{e}");
             app.ui.set_notice(e.into());
         }
+        log!("{:?}; default browser: {}", app.cfg, platform::is_default_browser());
 
         let mut session = Session::load(&app.paths.session());
         app.window_state = session.window.take();
@@ -810,7 +838,7 @@ impl App {
     fn on_environment(&mut self, result: Result<ICoreWebView2Environment, String>) {
         match result {
             Ok(env) => {
-                log!("WebView2 environment ready");
+                log!("WebView2 environment ready, runtime {}", webview::browser_version(&env));
                 self.env = Some(env);
                 let active = self.active;
                 self.activate(active);
@@ -981,6 +1009,18 @@ impl App {
             UiEvent::OpenExtensionsFolder => win::shell_open(&self.paths.extensions_dir()),
             UiEvent::ReloadExtensions => self.sync_extensions(true),
             UiEvent::OpenDataFolder => win::shell_open(&self.paths.root),
+            UiEvent::MakeDefaultBrowser => {
+                let result = std::env::current_exe()
+                    .map_err(|e| e.to_string())
+                    .and_then(|exe| platform::make_default_browser(&exe));
+                match result {
+                    Ok(()) => log!("registered as a browser; opened Windows' Default apps"),
+                    Err(e) => {
+                        log!("cannot register as a browser: {e}");
+                        self.set_status("無法向 Windows 登記為瀏覽器");
+                    }
+                }
+            }
             UiEvent::SaveSettings(s) => self.save_settings(s),
             UiEvent::DismissNotice => self.ui.set_notice(SharedString::new()),
             UiEvent::GeometryChanged => self.layout_views(),
@@ -997,7 +1037,9 @@ impl App {
             UiEvent::ImportRun { bookmarks, history } => self.run_import(bookmarks, history),
             UiEvent::ImportPasswordsCsv => self.import_passwords_csv(),
             UiEvent::OpenUrlFromOtherInstance(url) => {
+                // A link clicked in another app: the window comes up front, like Chrome's.
                 if let Some(hwnd) = self.hwnd {
+                    win::bring_to_front(hwnd);
                     win::focus_main_window(hwnd);
                 }
                 if let Some(url) = url_input::to_url(&url, &self.cfg.search_url) {
@@ -1151,6 +1193,7 @@ impl App {
                 old.last_active_ms = now;
             }
             self.active = idx;
+            log!("tab {}: switched to ({}, {} tabs)", self.tabs[idx].id, self.tabs[idx].site(), self.tabs.len());
             // A video that was playing full screen is no longer the tab on screen.
             if self.page_fullscreen {
                 self.page_fullscreen = false;
@@ -1192,7 +1235,10 @@ impl App {
                     self.ui.set_extensions_message(SharedString::new());
                     self.request_extension_list();
                 }
-                Page::Settings => self.ui.set_settings(self.settings_data()),
+                Page::Settings => {
+                    self.ui.set_settings(self.settings_data());
+                    self.ui.set_default_browser(platform::is_default_browser());
+                }
                 Page::Import => {
                     if self.import_profiles.is_empty() {
                         self.refresh_import();
@@ -1234,6 +1280,7 @@ impl App {
             return;
         }
         let tab = self.tabs.remove(idx);
+        log!("tab {}: closed ({})", tab.id, tab.site());
         if !tab.url.is_empty() && !tab.private {
             self.closed.push(SessionTab { url: tab.url.clone(), title: tab.title.clone(), pinned: tab.pinned });
             if self.closed.len() > 25 {
@@ -1358,6 +1405,7 @@ impl App {
         };
         match attached {
             Ok(view) => {
+                log!("tab {id}: page view created ({})", self.tabs[idx].site());
                 if self.tabs[idx].muted {
                     view.set_muted(true);
                 }
@@ -1472,11 +1520,21 @@ impl App {
 
     fn discard(&mut self, id: TabId) {
         let Some(idx) = self.index_of(id) else { return };
-        let tab = &mut self.tabs[idx];
+        let tab = &self.tabs[idx];
         if idx == self.active || tab.creating || tab.view.is_none() {
             return;
         }
-        log!("tab {id}: discarded ({} MB)", tab.bytes >> 20);
+        // Enough to tell which rule fired: idle time, the tab cap, the budget or low free memory.
+        let idle_s = self.now_ms().saturating_sub(tab.last_active_ms) / 1000;
+        let resident = self.tabs.iter().filter(|t| t.residency() != Residency::Discarded).count();
+        let tab = &mut self.tabs[idx];
+        log!(
+            "tab {id}: discarded ({}, {} MB, idle {idle_s}s; {resident} tabs hold pages, browser {} MB, {} MB free)",
+            tab.site(),
+            tab.bytes >> 20,
+            self.usage.bytes >> 20,
+            self.system_memory_free >> 20
+        );
         tab.drop_view();
     }
 
@@ -1487,6 +1545,7 @@ impl App {
             return;
         }
         if let Some(view) = &tab.view {
+            log!("tab {id}: frozen ({})", tab.site());
             view.set_visible(false);
             view.try_suspend(id);
             tab.suspended = true;
@@ -1571,6 +1630,7 @@ impl App {
                 // The docked DevTools view is not a tab (id 0), but its keys still drive the
                 // browser — F12 there must close it.
                 EngineEvent::Shortcut(s) => self.run_shortcut(s),
+                EngineEvent::ProcessFailed { detail, .. } => log!("view {id} (not a tab): WebView2 {detail}"),
                 _ => {}
             }
             return;
@@ -1622,7 +1682,10 @@ impl App {
                     self.refresh_toolbar();
                 }
             }
-            EngineEvent::NavigationCompleted => {
+            EngineEvent::NavigationCompleted(error) => {
+                if let Some(error) = error {
+                    log!("tab {id}: page failed to load ({}): {error}", self.tabs[idx].site());
+                }
                 self.tabs[idx].loading = false;
                 self.refresh_tabs();
                 if is_active {
@@ -1642,7 +1705,23 @@ impl App {
                 log!("tab {id}: the page closed itself (window.close)");
                 self.close_tab(idx);
             }
+            EngineEvent::ProcessFailed { detail, mut frame_hosts } => {
+                let tab = &self.tabs[idx];
+                let frames = if tab.private || frame_hosts.is_empty() {
+                    String::new()
+                } else {
+                    // A page with ten diagrams has ten frames from one host.
+                    frame_hosts.sort();
+                    let hosts: Vec<String> = frame_hosts
+                        .chunk_by(|a, b| a == b)
+                        .map(|same| if same.len() > 1 { format!("{} ×{}", same[0], same.len()) } else { same[0].clone() })
+                        .collect();
+                    format!("; frames: {}", hosts.join(", "))
+                };
+                log!("tab {id} ({}): WebView2 {detail}{frames}", tab.site());
+            }
             EngineEvent::RendererGone => {
+                log!("tab {id}: page renderer gone; {}", if is_active { "reloading" } else { "discarded" });
                 self.tabs[idx].drop_view();
                 if is_active {
                     self.set_status("分頁的網頁程序結束了，已重新載入");
@@ -2095,6 +2174,21 @@ impl App {
     // Periodic work
 
     fn tick(&mut self) {
+        // Ticks come every 2 s; a long gap means the UI thread was stuck (or a menu was open, or
+        // the PC slept). A stuck window is what Windows grays out or drops from its lists.
+        let now = self.now_ms();
+        if self.last_tick_ms > 0 && now - self.last_tick_ms > 10_000 {
+            log!("no tick for {} s (UI thread busy, a menu open, or the PC asleep)", (now - self.last_tick_ms) / 1000);
+        }
+        self.last_tick_ms = now;
+        if let Some(hwnd) = self.hwnd {
+            let state = win::window_state(hwnd);
+            if state != self.logged_window_state {
+                log!("window: {state}");
+                self.logged_window_state = state;
+            }
+        }
+
         let minimized = self.ui.window().is_minimized();
         if minimized != self.minimized {
             self.minimized = minimized;
@@ -2133,6 +2227,10 @@ impl App {
             self.status_message.clear();
         }
         self.refresh_status();
+        // The choice is made in Windows' Settings, so the page catches up when the user comes back.
+        if self.page() == Page::Settings {
+            self.ui.set_default_browser(platform::is_default_browser());
+        }
 
         let now = self.now_ms();
         if now.saturating_sub(self.last_save_ms) > 30_000 {

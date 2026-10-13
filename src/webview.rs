@@ -51,7 +51,10 @@ pub enum EngineEvent {
     TitleChanged(String),
     SourceChanged(String),
     NavigationStarting,
-    NavigationCompleted,
+    /// Why the page did not load; None when it did, or when the navigation was superseded.
+    NavigationCompleted(Option<String>),
+    /// A WebView2 process this tab used went away: what, why, and the hosts of the frames it ran.
+    ProcessFailed { detail: String, frame_hosts: Vec<String> },
     HistoryChanged { can_back: bool, can_forward: bool },
     NewWindow(NewWindowRequest),
     CloseRequested,
@@ -152,6 +155,99 @@ fn hresult_message(e: &windows::core::Error) -> String {
     format!("{} (0x{:08X})", e.message(), e.code().0)
 }
 
+/// Why a navigation failed, for the log. None when it loaded, or when it was cancelled (the user
+/// went elsewhere first), which is not a failure.
+fn navigation_error(args: &ICoreWebView2NavigationCompletedEventArgs) -> Option<String> {
+    let (mut ok, mut status) = (BOOL(0), COREWEBVIEW2_WEB_ERROR_STATUS::default());
+    unsafe {
+        args.IsSuccess(&mut ok).ok()?;
+        args.WebErrorStatus(&mut status).ok()?;
+    }
+    if ok.as_bool() || status == COREWEBVIEW2_WEB_ERROR_STATUS_OPERATION_CANCELED {
+        return None;
+    }
+    let name = match status {
+        COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_COMMON_NAME_IS_INCORRECT => "certificate name mismatch",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_EXPIRED => "certificate expired",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CLIENT_CERTIFICATE_CONTAINS_ERRORS => "client certificate error",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_REVOKED => "certificate revoked",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CERTIFICATE_IS_INVALID => "certificate invalid",
+        COREWEBVIEW2_WEB_ERROR_STATUS_SERVER_UNREACHABLE => "server unreachable",
+        COREWEBVIEW2_WEB_ERROR_STATUS_TIMEOUT => "timeout",
+        COREWEBVIEW2_WEB_ERROR_STATUS_ERROR_HTTP_INVALID_SERVER_RESPONSE => "invalid server response",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_ABORTED => "connection aborted",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CONNECTION_RESET => "connection reset",
+        COREWEBVIEW2_WEB_ERROR_STATUS_DISCONNECTED => "disconnected",
+        COREWEBVIEW2_WEB_ERROR_STATUS_CANNOT_CONNECT => "cannot connect",
+        COREWEBVIEW2_WEB_ERROR_STATUS_HOST_NAME_NOT_RESOLVED => "host name not resolved",
+        COREWEBVIEW2_WEB_ERROR_STATUS_REDIRECT_FAILED => "redirect failed",
+        COREWEBVIEW2_WEB_ERROR_STATUS_UNEXPECTED_ERROR => "unexpected error",
+        COREWEBVIEW2_WEB_ERROR_STATUS_VALID_AUTHENTICATION_CREDENTIALS_REQUIRED => "login required",
+        COREWEBVIEW2_WEB_ERROR_STATUS_VALID_PROXY_AUTHENTICATION_REQUIRED => "proxy login required",
+        _ => "unknown error",
+    };
+    let mut http = 0;
+    if let Ok(args2) = args.cast::<ICoreWebView2NavigationCompletedEventArgs2>() {
+        let _ = unsafe { args2.HttpStatusCode(&mut http) };
+    }
+    Some(if http > 0 { format!("{name} (status {}, HTTP {http})", status.0) } else { format!("{name} (status {})", status.0) })
+}
+
+/// What failed and why, plus the hosts of the frames the process ran (an iframe's renderer can
+/// die while the page lives on, leaving a blank box), for the log.
+fn process_failure(kind: COREWEBVIEW2_PROCESS_FAILED_KIND, args: &ICoreWebView2ProcessFailedEventArgs) -> (String, Vec<String>) {
+    let kind_name = match kind {
+        COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED => "browser process exited",
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED => "page renderer exited",
+        COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE => "page renderer unresponsive",
+        COREWEBVIEW2_PROCESS_FAILED_KIND_FRAME_RENDER_PROCESS_EXITED => "iframe renderer exited",
+        COREWEBVIEW2_PROCESS_FAILED_KIND_GPU_PROCESS_EXITED => "GPU process exited",
+        COREWEBVIEW2_PROCESS_FAILED_KIND_UTILITY_PROCESS_EXITED => "utility process exited",
+        _ => "process exited",
+    };
+    let mut detail = format!("{kind_name} (kind {})", kind.0);
+    let mut hosts = Vec::new();
+    // ICoreWebView2ProcessFailedEventArgs2: runtime 95+, so always there on our minimum.
+    let Ok(args2) = args.cast::<ICoreWebView2ProcessFailedEventArgs2>() else { return (detail, hosts) };
+    unsafe {
+        let (mut reason, mut exit, mut desc) = (COREWEBVIEW2_PROCESS_FAILED_REASON::default(), 0, PWSTR::null());
+        let _ = args2.Reason(&mut reason);
+        let _ = args2.ExitCode(&mut exit);
+        let _ = args2.ProcessDescription(&mut desc);
+        let reason_name = match reason {
+            COREWEBVIEW2_PROCESS_FAILED_REASON_UNRESPONSIVE => "unresponsive",
+            COREWEBVIEW2_PROCESS_FAILED_REASON_TERMINATED => "terminated",
+            COREWEBVIEW2_PROCESS_FAILED_REASON_CRASHED => "crashed",
+            COREWEBVIEW2_PROCESS_FAILED_REASON_LAUNCH_FAILED => "launch failed",
+            COREWEBVIEW2_PROCESS_FAILED_REASON_OUT_OF_MEMORY => "out of memory",
+            COREWEBVIEW2_PROCESS_FAILED_REASON_PROFILE_DELETED => "profile deleted",
+            _ => "unexpected",
+        };
+        detail.push_str(&format!(", reason {reason_name}, exit code {exit:#x}"));
+        let desc = take_pwstr(desc);
+        if !desc.is_empty() {
+            detail.push_str(&format!(", {desc}"));
+        }
+        // Held while iterating, as in `read_renderers`: the iterator doesn't keep it alive.
+        let frames = args2.FrameInfosForFailedProcess().ok();
+        if let Some(iter) = frames.as_ref().and_then(|c| c.GetIterator().ok()) {
+            let mut has = BOOL(0);
+            while iter.HasCurrent(&mut has).is_ok() && has.as_bool() {
+                if let Ok(frame) = iter.GetCurrent() {
+                    let mut src = PWSTR::null();
+                    if frame.Source(&mut src).is_ok() {
+                        hosts.extend(crate::url_input::host_of(&take_pwstr(src)));
+                    }
+                }
+                if iter.MoveNext(&mut has).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    (detail, hosts)
+}
+
 /// Starts creating the shared WebView2 environment (browser process). `done` runs on the UI
 /// thread once it is ready. An immediate error usually means the WebView2 Runtime is missing.
 pub fn create_environment(
@@ -179,6 +275,15 @@ pub fn create_environment(
     let folder = HSTRING::from(user_data.as_os_str());
     unsafe { CreateCoreWebView2EnvironmentWithOptions(PCWSTR::null(), &folder, &options, &handler) }
         .map_err(|e| hresult_message(&e))
+}
+
+/// The WebView2 Runtime's version, e.g. "141.0.3537.71".
+pub fn browser_version(env: &ICoreWebView2Environment) -> String {
+    let mut version = PWSTR::null();
+    match unsafe { env.BrowserVersionString(&mut version) } {
+        Ok(()) => take_pwstr(version),
+        Err(e) => hresult_message(&e),
+    }
 }
 
 /// Starts creating a WebView2 controller as a child of `parent`.
@@ -286,8 +391,9 @@ impl WebView {
             )?;
 
             core.add_NavigationCompleted(
-                &NavigationCompletedEventHandler::create(Box::new(move |_, _| {
-                    post_engine(tab, EngineEvent::NavigationCompleted);
+                &NavigationCompletedEventHandler::create(Box::new(move |_, args| {
+                    let error = args.as_ref().and_then(navigation_error);
+                    post_engine(tab, EngineEvent::NavigationCompleted(error));
                     Ok(())
                 })),
                 &mut token,
@@ -385,7 +491,8 @@ impl WebView {
                     let Some(args) = args else { return Ok(()) };
                     let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
                     args.ProcessFailedKind(&mut kind)?;
-                    log!("tab {tab}: WebView2 process failed, kind {}", kind.0);
+                    let (detail, frame_hosts) = process_failure(kind, &args);
+                    post_engine(tab, EngineEvent::ProcessFailed { detail, frame_hosts });
                     if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED {
                         post_engine(tab, EngineEvent::BrowserGone);
                     } else if kind == COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED {

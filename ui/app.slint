@@ -1051,6 +1051,8 @@ export component AppWindow inherits Window {
     in property <SettingsData> settings;
     in property <string> data-dir;
     in property <string> app-version;
+    // Windows opens http/https links from other apps in LiteBrowser.
+    in property <bool> default-browser;
     // Empty unless the MCP endpoint is running.
     in property <string> mcp-url;
     in property <string> window-title: "LiteBrowser";
@@ -1125,6 +1127,7 @@ export component AppWindow inherits Window {
     callback reload-extensions();
     callback install-extension(string);
     callback open-data-folder();
+    callback make-default-browser();
     callback save-settings(SettingsData);
     callback dismiss-notice();
     callback refresh-import();
@@ -2308,6 +2311,27 @@ export component AppWindow inherits Window {
                             }
 
                             SectionTitle {
+                                text: "預設瀏覽器";
+                            }
+
+                            Card {
+                                VerticalLayout {
+                                    SettingRow {
+                                        label: root.default-browser ? "LiteBrowser 是預設瀏覽器" : "設成預設瀏覽器";
+                                        sub: root.default-browser
+                                            ? "其他程式裡的連結會在這裡開啟"
+                                            : "按下後在 Windows 設定裡選 LiteBrowser，其他程式裡的連結就會在這裡開啟";
+                                        if !root.default-browser: PillButton {
+                                            text: "設為預設";
+                                            clicked => {
+                                                root.make-default-browser();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            SectionTitle {
                                 text: "外觀";
                             }
 
@@ -2717,6 +2741,9 @@ export component AppWindow inherits Window {
                                 }
 
                                 if root.site-kind == "insecure" && !root.suggestions-open: Text {
+                                    // Without a fixed width the label stretches like the address
+                                    // field next to it and takes half the bar.
+                                    width: self.preferred-width;
                                     text: "不安全";
                                     color: Theme.dim;
                                     vertical-alignment: center;

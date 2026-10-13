@@ -15,8 +15,8 @@ use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTAT
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetMenuItemCount, SendMessageW,
-    SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MF_CHECKED, MF_DISABLED, MF_GRAYED,
+    AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetMenuItemCount,
+    GetWindowThreadProcessId, SendMessageW, SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MF_CHECKED, MF_DISABLED, MF_GRAYED,
     MF_POPUP, MF_SEPARATOR, MF_STRING, MIIM_BITMAP, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTALIGN, TPM_RIGHTBUTTON,
     TPM_TOPALIGN, TRACK_POPUP_MENU_FLAGS, WM_COPYDATA,
 };
@@ -65,6 +65,122 @@ pub fn set_app_id() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Default browser
+
+/// ProgID that http/https links point at once the user picks LiteBrowser.
+const URL_PROGID: &str = "LiteBrowserURL";
+const CLIENT_KEY: &str = r"Software\Clients\StartMenuInternet\LiteBrowser";
+
+fn set_reg_string(subkey: &str, name: &str, value: &str) -> Result<(), String> {
+    use windows::Win32::System::Registry::{RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ};
+    let data: Vec<u16> = value.encode_utf16().chain([0]).collect();
+    let name = (!name.is_empty()).then(|| HSTRING::from(name));
+    let err = unsafe {
+        RegSetKeyValueW(
+            HKEY_CURRENT_USER,
+            &HSTRING::from(subkey),
+            name.as_ref().map_or(PCWSTR::null(), |n| PCWSTR(n.as_ptr())),
+            REG_SZ.0,
+            Some(data.as_ptr().cast()),
+            (data.len() * 2) as u32,
+        )
+    };
+    err.ok().map_err(|e| format!(r"HKCU\{subkey}: {}", e.message()))
+}
+
+/// Lists LiteBrowser among the browsers in Windows' Default apps (per user, no admin rights) and
+/// opens its page there. Since Windows 8 only the user may change the default browser, so this
+/// is as far as an app can go. Rewritten on every call: a portable exe may have moved.
+pub fn make_default_browser(exe: &std::path::Path) -> Result<(), String> {
+    let exe = exe.display().to_string();
+    let open = format!("\"{exe}\" \"%1\"");
+    let icon = format!("\"{exe}\",0");
+    let caps = format!(r"{CLIENT_KEY}\Capabilities");
+    let progid = format!(r"Software\Classes\{URL_PROGID}");
+    for (key, name, value) in [
+        (progid.as_str(), "", "LiteBrowser URL"),
+        (progid.as_str(), "URL Protocol", ""),
+        (&format!(r"{progid}\DefaultIcon"), "", &icon),
+        (&format!(r"{progid}\shell\open\command"), "", &open),
+        (CLIENT_KEY, "", "LiteBrowser"),
+        (&format!(r"{CLIENT_KEY}\DefaultIcon"), "", &icon),
+        (&format!(r"{CLIENT_KEY}\shell\open\command"), "", &format!("\"{exe}\"")),
+        (&caps, "ApplicationName", "LiteBrowser"),
+        (&caps, "ApplicationDescription", "給記憶體很少的電腦用的輕量瀏覽器"),
+        (&caps, "ApplicationIcon", &icon),
+        (&format!(r"{caps}\URLAssociations"), "http", URL_PROGID),
+        (&format!(r"{caps}\URLAssociations"), "https", URL_PROGID),
+        (&format!(r"{caps}\StartMenu"), "StartMenuInternet", "LiteBrowser"),
+        (r"Software\RegisteredApplications", "LiteBrowser", &caps),
+    ] {
+        set_reg_string(key, name, value)?;
+    }
+    unsafe {
+        use windows::Win32::UI::Shell::{SHChangeNotify, ShellExecuteW, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        // Windows 11 opens LiteBrowser's own page; Windows 10 ignores the argument and shows the
+        // Default apps list, where the user picks the web browser.
+        ShellExecuteW(
+            None,
+            &HSTRING::from("open"),
+            &HSTRING::from("ms-settings:defaultapps?registeredAppUser=LiteBrowser"),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+    Ok(())
+}
+
+/// A REG_SZ or REG_DWORD value as text; empty when it is missing.
+fn reg_value(root: windows::Win32::System::Registry::HKEY, subkey: &str, name: &str) -> String {
+    use windows::Win32::System::Registry::{RegGetValueW, REG_DWORD, REG_VALUE_TYPE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+    let mut buf = [0u16; 128];
+    let mut len = std::mem::size_of_val(&buf) as u32;
+    let mut kind = REG_VALUE_TYPE::default();
+    let err = unsafe {
+        RegGetValueW(
+            root,
+            &HSTRING::from(subkey),
+            &HSTRING::from(name),
+            RRF_RT_REG_SZ | RRF_RT_REG_DWORD,
+            Some(&mut kind),
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut len),
+        )
+    };
+    if err.is_err() {
+        String::new()
+    } else if kind == REG_DWORD {
+        (buf[0] as u32 | (buf[1] as u32) << 16).to_string()
+    } else {
+        String::from_utf16_lossy(&buf[..(len as usize / 2).saturating_sub(1).min(buf.len())])
+    }
+}
+
+/// Whether the user picked LiteBrowser for https links.
+pub fn is_default_browser() -> bool {
+    use windows::Win32::System::Registry::HKEY_CURRENT_USER;
+    let key = r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice";
+    reg_value(HKEY_CURRENT_USER, key, "ProgId") == URL_PROGID
+}
+
+/// E.g. "Windows 10 Enterprise 22H2, build 19045.5737".
+pub fn os_version() -> String {
+    use windows::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    let key = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion";
+    let get = |name| reg_value(HKEY_LOCAL_MACHINE, key, name);
+    let build = get("CurrentBuild");
+    let mut product = get("ProductName");
+    // ProductName still says Windows 10 on Windows 11, whose builds start at 22000.
+    if build.parse::<u32>().is_ok_and(|b| b >= 22000) {
+        product = product.replacen("Windows 10", "Windows 11", 1);
+    }
+    format!("{product} {}, build {build}.{}", get("DisplayVersion"), get("UBR"))
+}
+
 /// Holds the single-instance mutex for the process lifetime.
 pub struct SingleInstance {
     _handle: HANDLE,
@@ -103,21 +219,19 @@ fn send_to_existing(url: Option<&str>) {
         if hwnd.0.is_null() {
             return;
         }
-        let _ = SetForegroundWindow(hwnd);
-        if let Some(url) = url.filter(|u| !u.is_empty()) {
-            let bytes = url.as_bytes();
-            let cds = COPYDATASTRUCT {
-                dwData: WM_COPYDATA_OPEN_URL,
-                cbData: bytes.len() as u32,
-                lpData: bytes.as_ptr() as *mut _,
-            };
-            SendMessageW(
-                hwnd,
-                WM_COPYDATA,
-                Some(WPARAM(0)),
-                Some(LPARAM(&cds as *const _ as isize)),
-            );
-        }
+        // We were just launched by the user (a link clicked in another app), so we may hand the
+        // foreground on; the running instance could not take it by itself.
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut pid));
+        let _ = AllowSetForegroundWindow(pid);
+        // Sent without a URL too: starting LiteBrowser again brings the running one up.
+        let bytes = url.unwrap_or("").as_bytes();
+        let cds = COPYDATASTRUCT {
+            dwData: WM_COPYDATA_OPEN_URL,
+            cbData: bytes.len() as u32,
+            lpData: bytes.as_ptr() as *mut _,
+        };
+        SendMessageW(hwnd, WM_COPYDATA, Some(WPARAM(0)), Some(LPARAM(&cds as *const _ as isize)));
     }
 }
 
@@ -311,8 +425,12 @@ unsafe extern "system" fn singleton_proc(
         let cds = lparam.0 as *const COPYDATASTRUCT;
         if !cds.is_null() {
             let cds = unsafe { &*cds };
-            if cds.dwData == WM_COPYDATA_OPEN_URL && !cds.lpData.is_null() && cds.cbData > 0 {
-                let bytes = unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) };
+            if cds.dwData == WM_COPYDATA_OPEN_URL {
+                let bytes = if cds.lpData.is_null() || cds.cbData == 0 {
+                    &[][..]
+                } else {
+                    unsafe { std::slice::from_raw_parts(cds.lpData as *const u8, cds.cbData as usize) }
+                };
                 if let Ok(url) = std::str::from_utf8(bytes) {
                     let url = url.to_string();
                     ON_OPEN_URL.with(|c| {

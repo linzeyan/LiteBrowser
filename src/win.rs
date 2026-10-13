@@ -159,6 +159,50 @@ unsafe extern "system" fn subclass_proc(
     unsafe { DefSubclassProc(hwnd, msg, wparam, lparam) }
 }
 
+/// What decides whether Windows lists the window (taskbar, Alt+Tab, Task Manager's Apps): shown,
+/// minimized, cloaked, owned, tool window, on a monitor. Logged when it changes, so a window that
+/// "disappears" leaves a trace.
+pub fn window_state(hwnd: HWND) -> String {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::Graphics::Gdi::{MonitorFromWindow, MONITOR_DEFAULTTONULL};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindow, GetWindowRect, IsIconic, IsZoomed, GWL_EXSTYLE, GW_OWNER,
+    };
+    unsafe {
+        let mut cloaked = 0u32;
+        let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, (&mut cloaked as *mut u32).cast(), 4);
+        let mut rect = RECT::default();
+        let _ = GetWindowRect(hwnd, &mut rect);
+        let owner = GetWindow(hwnd, GW_OWNER).map_or(std::ptr::null_mut(), |h| h.0);
+        format!(
+            "visible={} minimized={} maximized={} cloaked={cloaked} on_monitor={} owner={owner:?} style={:#x} exstyle={:#x} rect=({},{})-({},{})",
+            IsWindowVisible(hwnd).as_bool() as u8,
+            IsIconic(hwnd).as_bool() as u8,
+            IsZoomed(hwnd).as_bool() as u8,
+            !MonitorFromWindow(hwnd, MONITOR_DEFAULTTONULL).is_invalid() as u8,
+            GetWindowLongPtrW(hwnd, GWL_STYLE),
+            GetWindowLongPtrW(hwnd, GWL_EXSTYLE),
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+        )
+    }
+}
+
+/// Restores the window if it is minimized and puts it in front. Only works while we may take the
+/// foreground, e.g. right after a second launch allowed it.
+pub fn bring_to_front(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
+    unsafe {
+        if IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
 /// Moves keyboard focus from the web page back to the Slint window.
 pub fn focus_main_window(hwnd: HWND) {
     PAGE_FOCUS.set(HWND::default());

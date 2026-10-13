@@ -93,6 +93,9 @@
 - 無痕分頁：Ctrl+Shift+N、⋮ 選單或分頁右鍵選單。分頁顯示面具圖示；切到無痕分頁時整個介面
   變成深色（同 Chrome 的無痕視窗），一眼就分得出來。關掉後不留 Cookie、
   歷史紀錄、快取或網站圖示，也不會被記進下次要恢復的分頁
+- 預設瀏覽器：設定頁最上面的「設為預設」會向 Windows 登記 LiteBrowser，並打開 Windows 的「預設應用程式」
+  讓你選它（Windows 不允許程式自己改預設瀏覽器）。之後其他程式裡的連結會在 LiteBrowser 開新分頁，
+  視窗縮小著也會跳到前面
 - 關閉時記住分頁，下次開啟時恢復（恢復的分頁都是「已釋放」狀態，不佔記憶體）
 - 分頁直接貼在視窗最上方（沒有系統標題列）：拖曳分頁列空白處可移動視窗，double-click 最大化，
   右上角有最小化／最大化／關閉
@@ -176,7 +179,8 @@ LiteBrowser 會向商店要 `.crx`，解開成一個資料夾放在 `extensions\
 | `extensions\` | 擴充功能資料夾 |
 | `webview2\` | Cookie、快取、儲存的密碼 |
 | `pending-import.json` | 等待下次啟動寫入的密碼 CSV 清單 |
-| `litebrowser.log` | 錯誤紀錄（有問題時請附上） |
+| `litebrowser.log` | 執行紀錄：版本、Windows 與 WebView2 版本、分頁的建立／凍結／釋放、載入失敗、網頁程序崩潰、視窗狀態變化（有問題時請附上；網址只記網域，無痕分頁不記） |
+| `litebrowser.old.log` | 上一份紀錄（超過 1 MB 時改名留下） |
 
 **可攜模式**：在 `LiteBrowser.exe` 旁邊建立 `portable.txt`（或 `data` 資料夾），資料就會放在 exe 旁的 `data\`。
 如果 VDI 登出後 `%LOCALAPPDATA%` 會被清空，請改用可攜模式並把 exe 放在會保留的磁碟（例如個人網路磁碟）。
