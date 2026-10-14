@@ -2330,8 +2330,9 @@ impl App {
         let sys = platform::system_memory();
         self.system_memory_free = sys.free_bytes;
         trace!(
-            "memory: browser {} MB, free {} MB; tabs {}",
+            "memory: browser {} MB in {} processes, free {} MB; tabs {}",
             self.usage.bytes >> 20,
+            self.usage.processes,
             sys.free_bytes >> 20,
             self.tabs.iter().map(|t| format!("{}:{:?}:{}MB", t.id, t.residency(), t.bytes >> 20)).collect::<Vec<_>>().join(" ")
         );
