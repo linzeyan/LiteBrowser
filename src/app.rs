@@ -19,7 +19,7 @@ use crate::adblock::Blocklist;
 use crate::config::Config;
 use crate::favicon::{self, FaviconCache};
 use crate::import::{self, Profile};
-use crate::logging::{self, log};
+use crate::logging::{self, debug, log, trace, Level};
 use crate::memory;
 use crate::paths::Paths;
 use crate::platform::{self, MenuItem};
@@ -79,6 +79,7 @@ pub enum Event {
     Tick,
 }
 
+#[derive(Debug)]
 pub enum UiEvent {
     Command(Shortcut),
     SelectTab(usize),
@@ -115,7 +116,10 @@ pub enum UiEvent {
     OpenExtensionsFolder,
     ReloadExtensions,
     OpenDataFolder,
+    OpenLogFile,
     MakeDefaultBrowser,
+    /// The notice's 立即重新啟動 after an update was downloaded.
+    RestartToUpdate,
     SaveSettings(SettingsData),
     DismissNotice,
     GeometryChanged,
@@ -256,11 +260,20 @@ pub fn run() {
     }
 
     tick.stop();
+    let mut restart = false;
     if let Some(mut app) = APP.with(|cell| cell.borrow_mut().take()) {
         app.shutdown();
+        restart = app.restart;
     }
     platform::destroy_singleton_window();
     log!("LiteBrowser exited");
+    if restart {
+        // The new process installs the staged update. It must find the mutex free, as above.
+        drop(instance);
+        if let Err(e) = std::env::current_exe().and_then(|exe| std::process::Command::new(exe).spawn()) {
+            log!("cannot restart: {e}");
+        }
+    }
 }
 
 /// Looks for a newer release in the background and stages it for the next start.
@@ -285,9 +298,8 @@ fn start_update_check() {
                         let _ = slint::invoke_from_event_loop(move || {
                             APP.with(|cell| {
                                 if let Some(app) = cell.borrow_mut().as_mut() {
-                                    app.ui.set_notice(
-                                        format!("已下載新版 {version}，重新啟動 LiteBrowser 即可更新。").into(),
-                                    );
+                                    app.ui.set_notice(format!("已下載新版 {version}，重新啟動 LiteBrowser 即可更新。").into());
+                                    app.ui.set_update_ready(true);
                                 }
                             });
                         });
@@ -444,7 +456,9 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_open_extensions_folder(|| ui_post(UiEvent::OpenExtensionsFolder));
     ui.on_reload_extensions(|| ui_post(UiEvent::ReloadExtensions));
     ui.on_open_data_folder(|| ui_post(UiEvent::OpenDataFolder));
+    ui.on_open_log_file(|| ui_post(UiEvent::OpenLogFile));
     ui.on_make_default_browser(|| ui_post(UiEvent::MakeDefaultBrowser));
+    ui.on_restart_to_update(|| ui_post(UiEvent::RestartToUpdate));
     ui.on_save_settings(|s| ui_post(UiEvent::SaveSettings(s)));
     ui.on_dismiss_notice(|| ui_post(UiEvent::DismissNotice));
     ui.on_content_geometry_changed(|| ui_post(UiEvent::GeometryChanged));
@@ -486,6 +500,17 @@ fn mcp_dispatch(call: mcp::Call) -> Result<serde_json::Value, String> {
     .map_err(|e| format!("無法送到瀏覽器：{e}"))?;
     // Long enough for a page to load and a script to run, short enough not to hang the model.
     rx.recv_timeout(Duration::from_secs(30)).map_err(|_| "瀏覽器沒有在時間內回應".to_string())?
+}
+
+/// An event as the log shows it: in full, or only its name when its fields are typed text or
+/// URLs that should not be written down.
+fn describe(event: &impl std::fmt::Debug, full: bool) -> String {
+    let text = format!("{event:?}");
+    if full {
+        text.chars().take(300).collect()
+    } else {
+        text[..text.find([' ', '(', '{']).unwrap_or(text.len())].to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -657,6 +682,8 @@ struct App {
     last_tick_ms: u64,
     /// The main window's state as last logged; a new line goes out only when it changes.
     logged_window_state: String,
+    /// Start again once the event loop ends, so a downloaded update gets installed.
+    restart: bool,
 }
 
 impl App {
@@ -665,6 +692,7 @@ impl App {
             Ok(cfg) => (cfg, None),
             Err(e) => (Config::default(), Some(e)),
         };
+        logging::set_level(Level::from_name(&cfg.log_level));
         let models = Models {
             tabs: Rc::new(VecModel::default()),
             suggestions: Rc::new(VecModel::default()),
@@ -685,6 +713,7 @@ impl App {
         ui.set_import_profiles(ModelRc::from(models.import_profiles.clone()));
         ui.set_data_dir(paths.root.display().to_string().into());
         ui.set_app_version(env!("CARGO_PKG_VERSION").into());
+        ui.set_search_hint(url_input::search_hint(&cfg.search_url).into());
 
         let installed_extensions = std::fs::read(paths.root.join("extensions.json"))
             .ok()
@@ -740,6 +769,7 @@ impl App {
             mcp_url: String::new(),
             last_tick_ms: 0,
             logged_window_state: String::new(),
+            restart: false,
         };
         if let Some(e) = cfg_error {
             log!("{e}");
@@ -919,7 +949,33 @@ impl App {
     // -----------------------------------------------------------------------------------------
     // UI events
 
+    fn log_ui_event(&self, event: &UiEvent) {
+        if !logging::enabled(Level::Debug) {
+            return;
+        }
+        // What the user typed or which page they asked for: only at trace, never in private.
+        let personal = matches!(
+            event,
+            UiEvent::Navigate(_)
+                | UiEvent::OpenUrl(_)
+                | UiEvent::OpenUrlNewTab(_)
+                | UiEvent::AddressEdited(_)
+                | UiEvent::HistorySearch(_)
+                | UiEvent::RemoveHistory(_)
+                | UiEvent::SaveBookmark { .. }
+                | UiEvent::OpenUrlFromOtherInstance(_)
+        );
+        let private = self.tabs.get(self.active).is_some_and(|t| t.private);
+        let text = describe(event, !personal || (logging::enabled(Level::Trace) && !private));
+        match event {
+            // One per keystroke, one per resize step.
+            UiEvent::AddressEdited(_) | UiEvent::GeometryChanged => trace!("ui {text}"),
+            _ => debug!("ui {text}"),
+        }
+    }
+
     fn handle_ui(&mut self, event: UiEvent) {
+        self.log_ui_event(&event);
         match event {
             UiEvent::Command(s) => self.run_shortcut(s),
             UiEvent::SelectTab(i) => self.activate(i),
@@ -1009,6 +1065,13 @@ impl App {
             UiEvent::OpenExtensionsFolder => win::shell_open(&self.paths.extensions_dir()),
             UiEvent::ReloadExtensions => self.sync_extensions(true),
             UiEvent::OpenDataFolder => win::shell_open(&self.paths.root),
+            UiEvent::OpenLogFile => {
+                // Windows 11 has no app for .log (it asks with "Open With"); Notepad reads it. Where
+                // Notepad was removed, the folder still lets the user pick the file up.
+                if std::process::Command::new("notepad.exe").arg(self.paths.log()).spawn().is_err() {
+                    win::shell_open(&self.paths.root);
+                }
+            }
             UiEvent::MakeDefaultBrowser => {
                 let result = std::env::current_exe()
                     .map_err(|e| e.to_string())
@@ -1022,7 +1085,14 @@ impl App {
                 }
             }
             UiEvent::SaveSettings(s) => self.save_settings(s),
-            UiEvent::DismissNotice => self.ui.set_notice(SharedString::new()),
+            UiEvent::RestartToUpdate => {
+                self.restart = true;
+                self.quit("restarting to install the downloaded update");
+            }
+            UiEvent::DismissNotice => {
+                self.ui.set_notice(SharedString::new());
+                self.ui.set_update_ready(false);
+            }
             UiEvent::GeometryChanged => self.layout_views(),
             UiEvent::ToggleDevtools => self.toggle_devtools(),
             UiEvent::DevtoolsDockMenu => self.devtools_dock_menu(),
@@ -1406,6 +1476,12 @@ impl App {
         match attached {
             Ok(view) => {
                 log!("tab {id}: page view created ({})", self.tabs[idx].site());
+                if !self.tabs[idx].private {
+                    view.watch_page_errors(id);
+                    if logging::enabled(Level::Debug) {
+                        view.set_page_log(true);
+                    }
+                }
                 if self.tabs[idx].muted {
                     view.set_muted(true);
                 }
@@ -1460,6 +1536,7 @@ impl App {
         for (i, tab) in self.tabs.iter().enumerate() {
             let Some(view) = &tab.view else { continue };
             if i == self.active {
+                trace!("layout: tab {} at {:?}, shown={show}", tab.id, (bounds.left, bounds.top, bounds.right, bounds.bottom));
                 view.set_bounds(bounds);
                 view.set_visible(show);
                 active_controller = Some(view.controller.clone());
@@ -1638,6 +1715,7 @@ impl App {
         let is_active = idx == self.active;
         match event {
             EngineEvent::TitleChanged(title) => {
+                trace!("tab {id}: title changed");
                 let tab = &mut self.tabs[idx];
                 tab.title = title;
                 if !tab.private {
@@ -1653,6 +1731,7 @@ impl App {
                 let tab = &mut self.tabs[idx];
                 if tab.url != url {
                     tab.url = url;
+                    debug!("tab {id}: now on {}", tab.site());
                     tab.favicon = Image::default();
                     self.session_dirty = true;
                     // Show a cached icon immediately; a fresh one may arrive via FaviconChanged.
@@ -1674,6 +1753,7 @@ impl App {
                 }
             }
             EngineEvent::NavigationStarting => {
+                debug!("tab {id}: navigation starting");
                 self.tabs[idx].loading = true;
                 // The new document starts without the old one's typing.
                 self.tabs[idx].unsaved = false;
@@ -1683,8 +1763,9 @@ impl App {
                 }
             }
             EngineEvent::NavigationCompleted(error) => {
-                if let Some(error) = error {
-                    log!("tab {id}: page failed to load ({}): {error}", self.tabs[idx].site());
+                match error {
+                    Some(error) => log!("tab {id}: page failed to load ({}): {error}", self.tabs[idx].site()),
+                    None => debug!("tab {id}: page loaded ({})", self.tabs[idx].site()),
                 }
                 self.tabs[idx].loading = false;
                 self.refresh_tabs();
@@ -1694,13 +1775,17 @@ impl App {
                 }
             }
             EngineEvent::HistoryChanged { can_back, can_forward } => {
+                trace!("tab {id}: history back={can_back} forward={can_forward}");
                 self.tabs[idx].can_back = can_back;
                 self.tabs[idx].can_forward = can_forward;
                 if is_active {
                     self.refresh_toolbar();
                 }
             }
-            EngineEvent::NewWindow(req) => self.on_new_window(idx, req),
+            EngineEvent::NewWindow(req) => {
+                debug!("tab {id}: the page opens a window{}", if req.background { " (background tab)" } else { "" });
+                self.on_new_window(idx, req)
+            }
             EngineEvent::CloseRequested => {
                 log!("tab {id}: the page closed itself (window.close)");
                 self.close_tab(idx);
@@ -1730,8 +1815,12 @@ impl App {
                 self.refresh_all();
             }
             EngineEvent::BrowserGone => self.on_browser_gone(),
-            EngineEvent::Shortcut(s) => self.run_shortcut(s),
+            EngineEvent::Shortcut(s) => {
+                debug!("tab {id}: shortcut {s:?}");
+                self.run_shortcut(s)
+            }
             EngineEvent::SuspendFinished(ok) => {
+                debug!("tab {id}: {}", if ok { "frozen" } else { "refused to freeze; asked to trim memory" });
                 if !ok {
                     // Could not freeze (e.g. audio playing); at least ask it to trim memory.
                     if let Some(view) = &self.tabs[idx].view {
@@ -1748,13 +1837,16 @@ impl App {
                 self.tabs[idx].unsaved = unsaved;
             }
             EngineEvent::Audible(playing) => {
+                trace!("tab {id}: audible={playing}");
                 self.tabs[idx].audible = playing;
                 self.refresh_tabs();
             }
             EngineEvent::Zoom(factor) => {
+                trace!("tab {id}: zoom {factor}");
                 self.set_site_zoom(idx, factor);
             }
             EngineEvent::FullScreen(on) => {
+                debug!("tab {id}: page full screen {on}");
                 // A background tab's video must not take over the window.
                 if idx == self.active {
                     self.page_fullscreen = on;
@@ -1762,6 +1854,7 @@ impl App {
                 }
             }
             EngineEvent::Favicon(bytes) => {
+                trace!("tab {id}: favicon, {} bytes", bytes.len());
                 // The new page has no icon: drop the previous page's from the tab, cache nothing.
                 if bytes.is_empty() {
                     self.tabs[idx].favicon = Image::default();
@@ -1934,6 +2027,7 @@ impl App {
             mcp_host: self.cfg.mcp_host.clone().into(),
             mcp_port: self.cfg.mcp_port as i32,
             dark_mode: self.cfg.dark_mode,
+            log_level: Level::from_name(&self.cfg.log_level) as i32,
         }
     }
 
@@ -1954,11 +2048,30 @@ impl App {
             mcp_host: s.mcp_host.to_string(),
             mcp_port: s.mcp_port.clamp(0, u16::MAX as i32) as u16,
             dark_mode: s.dark_mode,
+            log_level: match s.log_level {
+                1 => Level::Debug,
+                2 => Level::Trace,
+                _ => Level::Info,
+            }
+            .name()
+            .into(),
             ..old.clone()
         }
         .sanitized();
         let saved = self.cfg.save(&self.paths.config());
         self.ui.set_settings(self.settings_data());
+        self.ui.set_search_hint(url_input::search_hint(&self.cfg.search_url).into());
+        if old.log_level != self.cfg.log_level {
+            let was_debug = logging::enabled(Level::Debug);
+            logging::set_level(Level::from_name(&self.cfg.log_level));
+            log!("log level is now {}", self.cfg.log_level);
+            let debug = logging::enabled(Level::Debug);
+            if debug != was_debug {
+                for view in self.tabs.iter().filter(|t| !t.private).filter_map(|t| t.view.as_ref()) {
+                    view.set_page_log(debug);
+                }
+            }
+        }
         self.ui.set_devtools_right(self.cfg.devtools_dock_right);
         self.layout_views();
         if old.dark_mode != self.cfg.dark_mode {
@@ -2216,6 +2329,12 @@ impl App {
         self.usage = memory::browser_usage();
         let sys = platform::system_memory();
         self.system_memory_free = sys.free_bytes;
+        trace!(
+            "memory: browser {} MB, free {} MB; tabs {}",
+            self.usage.bytes >> 20,
+            sys.free_bytes >> 20,
+            self.tabs.iter().map(|t| format!("{}:{:?}:{}MB", t.id, t.residency(), t.bytes >> 20)).collect::<Vec<_>>().join(" ")
+        );
         self.apply_policy(Some(MemoryState { browser_bytes: self.usage.bytes, system_free_bytes: sys.free_bytes }));
         // Per-tab sizes for the next round's policy: the answer comes back asynchronously.
         if let Some(env) = &self.env {
@@ -2745,6 +2864,8 @@ impl App {
 
     fn run_mcp_call(&mut self, call: mcp::Call, answer: McpAnswer) {
         use mcp::Call;
+        // URLs and scripts only at trace.
+        debug!("mcp {}", describe(&call, logging::enabled(Level::Trace)));
         let reply = |answer: &McpAnswer, value: Result<serde_json::Value, String>| {
             let _ = answer.send(value);
         };

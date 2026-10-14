@@ -90,6 +90,20 @@ pub fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_ascii_lowercase())
 }
 
+/// The search box's placeholder, naming the engine `search_url` points at like Chrome's
+/// "搜尋 Google 或輸入網址". An engine we don't know by name is left unnamed.
+pub fn search_hint(search_url: &str) -> String {
+    const ENGINES: &[(&str, &str)] =
+        &[("google", "Google"), ("bing", "Bing"), ("duckduckgo", "DuckDuckGo"), ("yahoo", "Yahoo"), ("ecosia", "Ecosia")];
+    let host = host_of(search_url).unwrap_or_default();
+    // The engine is the label before the public suffix: www.google.com.tw → google.
+    let name = ENGINES.iter().find(|(label, _)| host.split('.').any(|part| part == *label)).map(|e| e.1);
+    match name {
+        Some(name) => format!("搜尋 {name} 或輸入網址"),
+        None => "搜尋或輸入網址".into(),
+    }
+}
+
 /// How the omnibox shows a URL while it is not being edited: no http(s) scheme (the site icon
 /// already tells them apart) and no lone trailing slash, as Chrome and Firefox show it.
 pub fn display(url: &str) -> String {
@@ -154,6 +168,16 @@ mod tests {
         assert_eq!(display("https://www.google.com/search?q=x"), "www.google.com/search?q=x");
         assert_eq!(display("file:///C:/a.html"), "file:///C:/a.html");
         assert_eq!(display(""), "");
+    }
+
+    #[test]
+    fn search_hint_names_known_engines_only() {
+        assert_eq!(search_hint(S), "搜尋 Google 或輸入網址");
+        assert_eq!(search_hint("https://www.google.com.tw/search?q={}"), "搜尋 Google 或輸入網址");
+        assert_eq!(search_hint("https://duckduckgo.com/?q={}"), "搜尋 DuckDuckGo 或輸入網址");
+        // A host that merely contains a name is not that engine.
+        assert_eq!(search_hint("https://notgoogle.example/?q={}"), "搜尋或輸入網址");
+        assert_eq!(search_hint("https://search.internal.corp/?q={}"), "搜尋或輸入網址");
     }
 
     #[test]

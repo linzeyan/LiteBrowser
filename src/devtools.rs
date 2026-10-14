@@ -169,9 +169,78 @@ pub fn browser_switches() -> &'static str {
     "--remote-debugging-port=0 --remote-allow-origins=* --disable-blink-features=AutomationControlled"
 }
 
+/// The DevTools protocol events [`page_error`] reads.
+pub const PAGE_ERROR_EVENTS: [&str; 3] = ["Runtime.exceptionThrown", "Runtime.consoleAPICalled", "Log.entryAdded"];
+
+/// One log line for what a page reported about itself over the DevTools protocol: an uncaught
+/// exception, a console.error, or an error the browser logged for it (a failed request, a CSP
+/// block). `None` for anything milder. Where the page says it broke is usually why it broke.
+pub fn page_error(event: &str, params: &str) -> Option<String> {
+    let v: serde_json::Value = serde_json::from_str(params).ok()?;
+    let (kind, message, at) = match event {
+        "Runtime.exceptionThrown" => {
+            let d = &v["exceptionDetails"];
+            let message = d["exception"]["description"].as_str().or(d["text"].as_str())?;
+            ("exception".to_string(), message.to_string(), location(d).or_else(|| location(&d["stackTrace"]["callFrames"][0])))
+        }
+        "Runtime.consoleAPICalled" if v["type"] == "error" => {
+            let args: Vec<String> = v["args"]
+                .as_array()?
+                .iter()
+                .map(|a| a["value"].as_str().or(a["description"].as_str()).map_or_else(|| a["value"].to_string(), String::from))
+                .collect();
+            ("console.error".to_string(), args.join(" "), location(&v["stackTrace"]["callFrames"][0]))
+        }
+        "Log.entryAdded" if v["entry"]["level"] == "error" => {
+            let e = &v["entry"];
+            (format!("{} error", e["source"].as_str().unwrap_or("browser")), e["text"].as_str()?.to_string(), location(e))
+        }
+        _ => return None,
+    };
+    // A stack trace or a data: URL would swamp the log; the first line names the error.
+    let first = message.lines().next().unwrap_or_default();
+    let line = match at {
+        Some(at) => format!("{kind}: {first} @ {at}"),
+        None => format!("{kind}: {first}"),
+    };
+    Some(line.chars().take(400).collect())
+}
+
+/// `url:line:column` (1-based) of a CDP location, without the query string, which can hold tokens.
+fn location(v: &serde_json::Value) -> Option<String> {
+    let url = v["url"].as_str().filter(|u| !u.is_empty())?;
+    let url = &url[..url.find(['?', '#']).unwrap_or(url.len())];
+    Some(match v["lineNumber"].as_u64() {
+        Some(line) => format!("{url}:{}:{}", line + 1, v["columnNumber"].as_u64().unwrap_or(0) + 1),
+        None => url.to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_errors_name_the_error_and_where_it_happened() {
+        let exception = r#"{"exceptionDetails":{"text":"Uncaught","lineNumber":0,"columnNumber":41,
+            "url":"https://cdn.oaistatic.com/app.js?v=1","exception":{"description":"TypeError: x is not a function\n    at f (app.js:1:42)"}}}"#;
+        assert_eq!(
+            page_error("Runtime.exceptionThrown", exception).unwrap(),
+            "exception: TypeError: x is not a function @ https://cdn.oaistatic.com/app.js:1:42"
+        );
+        let console = r#"{"type":"error","args":[{"type":"string","value":"stream failed"},{"type":"number","value":429}],
+            "stackTrace":{"callFrames":[{"url":"https://chatgpt.com/c.js","lineNumber":9,"columnNumber":0}]}}"#;
+        assert_eq!(page_error("Runtime.consoleAPICalled", console).unwrap(), "console.error: stream failed 429 @ https://chatgpt.com/c.js:10:1");
+        let network = r#"{"entry":{"source":"network","level":"error","text":"Failed to load resource: net::ERR_CONNECTION_RESET",
+            "url":"https://chatgpt.com/backend-api/conversation?token=secret"}}"#;
+        assert_eq!(
+            page_error("Log.entryAdded", network).unwrap(),
+            "network error: Failed to load resource: net::ERR_CONNECTION_RESET @ https://chatgpt.com/backend-api/conversation"
+        );
+        // console.log and browser warnings are not errors; they would bury the ones that are.
+        assert_eq!(page_error("Runtime.consoleAPICalled", r#"{"type":"log","args":[]}"#), None);
+        assert_eq!(page_error("Log.entryAdded", r#"{"entry":{"source":"violation","level":"warning","text":"x"}}"#), None);
+    }
 
     const BODY: &str = r#"[
         {"type":"page","url":"https://github.com/","webSocketDebuggerUrl":"ws://127.0.0.1:51234/devtools/page/AAA",

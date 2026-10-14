@@ -13,7 +13,8 @@ use webview2_com::{
     ContainsFullScreenElementChangedEventHandler,
     ExecuteScriptCompletedHandler, GetProcessExtendedInfosCompletedHandler,
     BrowserExtensionRemoveCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
-    CreateCoreWebView2EnvironmentCompletedHandler, DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
+    CreateCoreWebView2EnvironmentCompletedHandler, DevToolsProtocolEventReceivedEventHandler,
+    DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
     GetFaviconCompletedHandler, HistoryChangedEventHandler, IsDocumentPlayingAudioChangedEventHandler,
     NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
@@ -28,7 +29,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MB
 
 use crate::adblock::Blocklist;
 use crate::app::{post, Event};
-use crate::logging::log;
+use crate::devtools;
+use crate::logging::{debug, log};
 use crate::shortcuts::{self, Modifiers, Shortcut};
 use crate::tabs::TabId;
 
@@ -592,7 +594,7 @@ impl WebView {
             }
 
             if let Some(blocklist) = blocklist {
-                install_blocker(core, env, blocklist)?;
+                install_blocker(core, env, tab, blocklist)?;
             }
 
             Ok(view)
@@ -778,6 +780,44 @@ impl WebView {
         unsafe { wv13.Profile().ok()?.cast::<ICoreWebView2Profile7>().ok() }
     }
 
+    /// Logs what the page reports about itself (see [`devtools::page_error`]) at debug level.
+    /// This only listens; [`WebView::set_page_log`] makes the page report.
+    pub fn watch_page_errors(&self, tab: TabId) {
+        for event in devtools::PAGE_ERROR_EVENTS {
+            let Ok(receiver) = (unsafe { self.core.GetDevToolsProtocolEventReceiver(&HSTRING::from(event)) }) else {
+                continue;
+            };
+            let handler = DevToolsProtocolEventReceivedEventHandler::create(Box::new(move |_, args| {
+                let Some(args) = args else { return Ok(()) };
+                let mut json = PWSTR::null();
+                unsafe { args.ParameterObjectAsJson(&mut json)? };
+                if let Some(line) = devtools::page_error(event, &take_pwstr(json)) {
+                    debug!("tab {tab}: page {line}");
+                }
+                Ok(())
+            }));
+            let mut token = 0i64;
+            unsafe {
+                let _ = receiver.add_DevToolsProtocolEventReceived(&handler, &mut token);
+            }
+        }
+    }
+
+    /// Starts or stops the page's error reports. Off unless the log is at debug level: with the
+    /// Runtime domain on, every console call crosses to us and what it logged stays alive.
+    pub fn set_page_log(&self, on: bool) {
+        for domain in ["Runtime", "Log"] {
+            let method = format!("{domain}.{}", if on { "enable" } else { "disable" });
+            unsafe {
+                let _ = self.core.CallDevToolsProtocolMethod(
+                    &HSTRING::from(method),
+                    &HSTRING::from("{}"),
+                    None::<&ICoreWebView2CallDevToolsProtocolMethodCompletedHandler>,
+                );
+            }
+        }
+    }
+
     /// The main frame's id, the same kind of id [`renderer_frames`] reports. Needs ICoreWebView2_20.
     pub fn frame_id(&self) -> Option<u32> {
         let wv20 = self.core.cast::<ICoreWebView2_20>().ok()?;
@@ -843,6 +883,7 @@ unsafe fn read_renderers(infos: &ICoreWebView2ProcessExtendedInfoCollection) -> 
 fn install_blocker(
     core: &ICoreWebView2,
     env: &ICoreWebView2Environment,
+    tab: TabId,
     blocklist: Rc<Blocklist>,
 ) -> windows::core::Result<()> {
     unsafe {
@@ -866,12 +907,15 @@ fn install_blocker(
                 let Some(args) = args else { return Ok(()) };
                 let mut uri = PWSTR::null();
                 args.Request()?.Uri(&mut uri)?;
+                let uri = take_pwstr(uri);
                 // The filter patterns are a coarse wildcard match; confirm the host really is listed.
-                if blocklist.is_blocked_url(&take_pwstr(uri)) {
+                if blocklist.is_blocked_url(&uri) {
                     let response =
                         env.CreateWebResourceResponse(None::<&IStream>, 403, &HSTRING::from("Blocked"), &HSTRING::new())?;
                     args.SetResponse(&response)?;
                     BLOCKED_REQUESTS.with(|c| c.set(c.get() + 1));
+                    // A site that half works often needs something the list blocks.
+                    debug!("tab {tab}: blocked a request to {}", crate::url_input::host_of(&uri).unwrap_or_default());
                 }
                 Ok(())
             })),

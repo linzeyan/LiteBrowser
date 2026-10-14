@@ -44,6 +44,8 @@ pub struct Config {
     pub dark_mode: bool,
     /// Extra Chromium command-line switches for WebView2. Needs a restart.
     pub extra_browser_args: String,
+    /// How much goes into litebrowser.log: "info", "debug" or "trace".
+    pub log_level: String,
 }
 
 impl Default for Config {
@@ -67,6 +69,7 @@ impl Default for Config {
             show_bookmarks_bar: true,
             dark_mode: false,
             extra_browser_args: String::new(),
+            log_level: "info".into(),
         }
     }
 }
@@ -106,6 +109,7 @@ impl Config {
             Ok(ip) => ip.to_string(),
             Err(_) => Config::default().mcp_host,
         };
+        self.log_level = crate::logging::Level::from_name(self.log_level.trim()).name().into();
         self
     }
 

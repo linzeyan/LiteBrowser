@@ -80,6 +80,8 @@ export struct SettingsData {
     mcp-host: string,
     mcp-port: int,
     dark-mode: bool,
+    // 0 info, 1 debug, 2 trace.
+    log-level: int,
 }
 
 global Theme {
@@ -1048,6 +1050,10 @@ export component AppWindow inherits Window {
     in property <bool> memory-over;
     // Error banner (e.g. WebView2 runtime missing). Empty = hidden.
     in property <string> notice;
+    // The notice is about a downloaded update, so it offers to restart into it.
+    in property <bool> update-ready;
+    // "搜尋 Google 或輸入網址", or without the engine when it isn't a known one.
+    in property <string> search-hint: "搜尋或輸入網址";
     in property <SettingsData> settings;
     in property <string> data-dir;
     in property <string> app-version;
@@ -1127,7 +1133,10 @@ export component AppWindow inherits Window {
     callback reload-extensions();
     callback install-extension(string);
     callback open-data-folder();
+    callback open-log-file();
     callback make-default-browser();
+    // The update notice's "restart now".
+    callback restart-to-update();
     callback save-settings(SettingsData);
     callback dismiss-notice();
     callback refresh-import();
@@ -1670,6 +1679,17 @@ export component AppWindow inherits Window {
                         color: #3d2e00;
                     }
 
+                    if root.update-ready: VerticalLayout {
+                        alignment: center;
+                        PillButton {
+                            text: "立即重新啟動";
+                            primary: true;
+                            clicked => {
+                                root.restart-to-update();
+                            }
+                        }
+                    }
+
                     IconButton {
                         icon: Icons.close;
                         size: 28px;
@@ -1797,21 +1817,13 @@ export component AppWindow inherits Window {
                     background: Theme.surface;
                     // Rows of up to five; eight tiles split evenly into 4 + 4.
                     property <int> cols: root.top-sites.length <= 5 ? root.top-sites.length : Math.ceil(root.top-sites.length / 2);
-                    property <length> top: max(24px, (self.height - 370px) * 0.4);
-
-                    Text {
-                        y: ntp.top;
-                        width: parent.width;
-                        text: "LiteBrowser";
-                        font-size: 36px;
-                        font-weight: 600;
-                        color: Theme.text;
-                        horizontal-alignment: center;
-                    }
+                    // No wordmark above the box: ours says nothing the user needs, and the search
+                    // engine's logo isn't ours to draw. The box names the engine instead, like Chrome's.
+                    property <length> top: max(24px, (self.height - 300px) * 0.4);
 
                     fakebox := Rectangle {
                         x: (parent.width - self.width) / 2;
-                        y: ntp.top + 68px;
+                        y: ntp.top;
                         width: min(584px, parent.width - 64px);
                         height: 46px;
                         border-radius: 23px;
@@ -1842,7 +1854,7 @@ export component AppWindow inherits Window {
                             }
 
                             Text {
-                                text: "搜尋或輸入網址";
+                                text: root.search-hint;
                                 font-size: 15px;
                                 color: Theme.dim;
                                 vertical-alignment: center;
@@ -2268,7 +2280,12 @@ export component AppWindow inherits Window {
                 // wait a moment so typing "12" does not apply a 1 on the way.
                 if root.page == Page.settings: settings-page := Rectangle {
                     background: Theme.page;
+                    property <int> log-level: root.settings.log-level;
 
+                    function set-log-level(level: int) {
+                        self.log-level = level;
+                        self.save();
+                    }
                     function save() {
                         root.save-settings({
                             max-live-tabs: live.value,
@@ -2285,6 +2302,7 @@ export component AppWindow inherits Window {
                             mcp-host: mcp-host.text,
                             mcp-port: mcp-port.value,
                             dark-mode: dark-toggle.checked,
+                            log-level: settings-page.log-level,
                         });
                     }
                     function save-soon() {
@@ -2622,6 +2640,56 @@ export component AppWindow inherits Window {
                                             }
                                         }
                                     }
+
+                                    Divider { }
+
+                                    // Raised while chasing a problem, then put back: the higher
+                                    // levels fill the file fast.
+                                    SettingRow {
+                                        label: "執行紀錄的詳細程度";
+                                        sub: settings-page.log-level == 0
+                                            ? "一般：啟動、分頁、錯誤。回報問題時附上 litebrowser.log"
+                                            : settings-page.log-level == 1
+                                            ? "詳細：再加上每個操作、網頁的錯誤訊息與被封鎖的請求。查完問題請調回一般"
+                                            : "最詳細：所有事件（含輸入的網址，無痕分頁除外）、每 2 秒的記憶體、視窗訊息。檔案長得很快，查完問題請調回一般";
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            PillButton {
+                                                text: "一般";
+                                                primary: settings-page.log-level == 0;
+                                                clicked => {
+                                                    settings-page.set-log-level(0);
+                                                }
+                                            }
+
+                                            PillButton {
+                                                text: "詳細";
+                                                primary: settings-page.log-level == 1;
+                                                clicked => {
+                                                    settings-page.set-log-level(1);
+                                                }
+                                            }
+
+                                            PillButton {
+                                                text: "最詳細";
+                                                primary: settings-page.log-level == 2;
+                                                clicked => {
+                                                    settings-page.set-log-level(2);
+                                                }
+                                            }
+
+                                            Rectangle {
+                                                width: 8px;
+                                            }
+
+                                            PillButton {
+                                                text: "開啟紀錄檔";
+                                                clicked => {
+                                                    root.open-log-file();
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
 
@@ -2763,7 +2831,7 @@ export component AppWindow inherits Window {
                         if root.address == "" && !address-input.has-focus: Text {
                             width: 100%;
                             height: 100%;
-                            text: "搜尋或輸入網址";
+                            text: root.search-hint;
                             font-size: 15px;
                             color: Theme.dim;
                             vertical-alignment: center;

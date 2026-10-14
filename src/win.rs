@@ -13,9 +13,11 @@ use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecute
 use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsChild, IsWindowVisible, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SC_KEYMENU, SWP_FRAMECHANGED, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_MOVE,
-    WM_MOVING, WM_SETICON, WM_SIZE, WM_SYSCOMMAND, WS_CLIPCHILDREN,
+    SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
+    WM_LBUTTONDOWN, WM_MOVE, WM_MOVING, WM_SETFOCUS, WM_SETICON, WM_SHOWWINDOW, WM_SIZE, WM_SYSCOMMAND, WS_CLIPCHILDREN,
 };
+
+use crate::logging::trace;
 
 thread_local! {
     /// Controller of the visible tab, so window moves can be forwarded without touching app state.
@@ -86,6 +88,19 @@ unsafe extern "system" fn subclass_proc(
     _id: usize,
     _data: usize,
 ) -> LRESULT {
+    // The messages behind a window that vanishes, won't come up, or loses its focus.
+    let name = match msg {
+        WM_ACTIVATE => "WM_ACTIVATE",
+        WM_SETFOCUS => "WM_SETFOCUS",
+        WM_KILLFOCUS => "WM_KILLFOCUS",
+        WM_SHOWWINDOW => "WM_SHOWWINDOW",
+        WM_SIZE => "WM_SIZE",
+        WM_SYSCOMMAND => "WM_SYSCOMMAND",
+        _ => "",
+    };
+    if !name.is_empty() {
+        trace!("{name} wparam={:#x} lparam={:#x}", wparam.0, lparam.0);
+    }
     match msg {
         // WebView2 positions its own popups (<select> lists, context menus) relative to the
         // parent window, so it must hear about moves.
