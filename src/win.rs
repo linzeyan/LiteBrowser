@@ -14,8 +14,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW, IsChild, IsWindowVisible, LoadImageW, SendMessageW, SetWindowLongPtrW, SetWindowPos, GWL_STYLE,
     ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTSIZE, LR_SHARED, SC_KEYMENU, SWP_FRAMECHANGED, SWP_NOMOVE,
     SWP_NOSIZE, SWP_NOZORDER, SW_SHOWNORMAL, WA_INACTIVE, WM_ACTIVATE, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS,
-    WM_LBUTTONDOWN, WM_MOVE, WM_MOVING, WM_SETFOCUS, WM_SETICON, WM_SHOWWINDOW, WM_SIZE, WM_SYSCOMMAND, WS_CLIPCHILDREN,
+    WM_LBUTTONDOWN, WM_MBUTTONDOWN, WM_MOUSEMOVE, WM_MOVE, WM_MOVING, WM_PAINT, WM_RBUTTONDOWN, WM_SETFOCUS,
+    WM_SETICON, WM_SHOWWINDOW, WM_SIZE, WM_SYSCOMMAND, WS_CLIPCHILDREN,
 };
+use windows::Win32::Graphics::Gdi::GetUpdateRect;
 
 use crate::logging::trace;
 
@@ -101,6 +103,14 @@ unsafe extern "system" fn subclass_proc(
     if !name.is_empty() {
         trace!("{name} wparam={:#x} lparam={:#x}", wparam.0, lparam.0);
     }
+    // winit stamps a button press with the last position a WM_MOUSEMOVE gave it, but while a
+    // native menu is open the moves go to the menu. The click that closes a tab's menu by landing
+    // on another tab was taken as a press on the first tab, and the move that followed as a drag:
+    // the two tabs swapped. Hand winit the click's own position first; a move to where the cursor
+    // already is raises no event, so ordinary clicks are unaffected.
+    if matches!(msg, WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN) {
+        unsafe { DefSubclassProc(hwnd, WM_MOUSEMOVE, wparam, lparam) };
+    }
     match msg {
         // WebView2 positions its own popups (<select> lists, context menus) relative to the
         // parent window, so it must hear about moves.
@@ -113,6 +123,15 @@ unsafe extern "system" fn subclass_proc(
                 }
             });
         }
+        // Windows wants a part of the window painted that something covered, usually a WebView
+        // that just moved away. Slint only redraws what it changed itself, so whatever it drew
+        // under that WebView never reached the screen: have it draw everything again. winit's
+        // own redraw requests carry no update region, so this doesn't feed on itself.
+        WM_PAINT => unsafe {
+            if GetUpdateRect(hwnd, None, false).as_bool() {
+                crate::app::post(crate::app::Event::RepaintAll);
+            }
+        },
         // Restoring or resizing can leave the software-rendered chrome stale next to the native
         // child window, so repaint everything.
         WM_SIZE => {

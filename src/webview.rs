@@ -601,6 +601,16 @@ impl WebView {
         }
     }
 
+    /// Runs `script` at the start of every document this view loads from now on.
+    pub fn add_startup_script(&self, script: &str) {
+        unsafe {
+            let _ = self.core.AddScriptToExecuteOnDocumentCreated(
+                &HSTRING::from(script),
+                None::<&ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler>,
+            );
+        }
+    }
+
     pub fn navigate(&self, url: &str) {
         if let Err(e) = unsafe { self.core.Navigate(&HSTRING::from(url)) } {
             // No URL in the log: it may be a private tab's.

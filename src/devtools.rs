@@ -160,6 +160,26 @@ pub fn frontend_url(port: u16, target: &Target) -> Option<String> {
     Some(format!("http://127.0.0.1:{port}/devtools/devtools_app.html?ws={ws}"))
 }
 
+/// Runs in the DevTools frontend before its own code and seeds the settings it hasn't stored yet.
+///
+/// Served over plain http, the frontend keeps its settings in the origin's localStorage, and the
+/// origin carries the debugging port Chromium picks afresh at every start: whatever the user set
+/// last time is gone, and the frontend comes up as on a first run, on Edge's Welcome tab. Closing
+/// that tab is itself one of those settings (`closeable-tabs`), so it came back at every start.
+/// So the defaults the user wants are written in every time, unless they already changed them in
+/// this run. Keys as in Edge's frontend (runtime 155); values are JSON, as the frontend stores them.
+pub const FRONTEND_DEFAULTS_SCRIPT: &str = r#"(() => {
+  const defaults = {
+    'panel-selected-tab': '"network"',
+    'network-log.preserve-log': 'true',
+    'cache-disabled': 'true',
+    'closeable-tabs': '{"welcome":false}',
+  };
+  for (const [key, value] of Object.entries(defaults)) {
+    if (localStorage.getItem(key) === null) localStorage.setItem(key, value);
+  }
+})();"#;
+
 /// The browser switches that enable the remote-debugging server.
 ///
 /// The port alone marks the browser as automation-controlled (`navigator.webdriver` is true), and

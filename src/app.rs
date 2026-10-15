@@ -16,7 +16,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_APARTMENTTHREADED};
 
 use crate::adblock::Blocklist;
-use crate::config::Config;
+use crate::config::{Config, DevtoolsDock};
 use crate::favicon::{self, FaviconCache};
 use crate::import::{self, Profile};
 use crate::logging::{self, debug, log, trace, Level};
@@ -45,6 +45,23 @@ const INTERNAL_PAGES: [(Page, &str, &str); 5] = [
     (Page::Settings, "litebrowser://settings", "設定"),
     (Page::Import, "litebrowser://import", "從其他瀏覽器匯入"),
 ];
+
+/// The config's dock side as the UI names it, and back.
+fn dock_side(dock: DevtoolsDock) -> DockSide {
+    match dock {
+        DevtoolsDock::Bottom => DockSide::Bottom,
+        DevtoolsDock::Left => DockSide::Left,
+        DevtoolsDock::Right => DockSide::Right,
+    }
+}
+
+fn devtools_dock(side: DockSide) -> DevtoolsDock {
+    match side {
+        DockSide::Bottom => DevtoolsDock::Bottom,
+        DockSide::Left => DevtoolsDock::Left,
+        DockSide::Right => DevtoolsDock::Right,
+    }
+}
 
 /// What a tab with this URL shows.
 fn page_of(url: &str) -> Page {
@@ -76,7 +93,21 @@ pub enum Event {
     ExtensionHostCreated(Result<ICoreWebView2Controller, String>),
     /// Each renderer PID with the ids of the frames it runs.
     RendererFrames(Vec<(u32, Vec<u32>)>),
+    /// The background update check moved on.
+    Update(UpdateStep),
+    /// Windows asked to paint a part of the window that something had covered.
+    RepaintAll,
     Tick,
+}
+
+pub enum UpdateStep {
+    /// A newer release was found and is being downloaded: its version.
+    Downloading(String),
+    /// That release is staged for the next start.
+    Ready(String),
+    UpToDate,
+    /// What went wrong, as the settings page shows it.
+    Failed(String),
 }
 
 #[derive(Debug)]
@@ -118,8 +149,10 @@ pub enum UiEvent {
     OpenDataFolder,
     OpenLogFile,
     MakeDefaultBrowser,
-    /// The notice's 立即重新啟動 after an update was downloaded.
+    /// The notice's or the settings page's 立即重新啟動 after an update was downloaded.
     RestartToUpdate,
+    /// The settings page's 檢查更新.
+    CheckUpdate,
     SaveSettings(SettingsData),
     DismissNotice,
     GeometryChanged,
@@ -130,7 +163,8 @@ pub enum UiEvent {
     MainMenu(f32, f32),
     AddressMenu,
     ToggleDevtools,
-    DevtoolsDockMenu,
+    /// A dock button on the DevTools strip.
+    DockDevtools(DockSide),
     MinimizeWindow,
     ToggleMaximizeWindow,
     CloseWindow,
@@ -249,7 +283,6 @@ pub fn run() {
     APP.with(|cell| *cell.borrow_mut() = Some(app));
 
     start_mcp_server();
-    start_update_check();
 
     let tick = slint::Timer::default();
     tick.start(slint::TimerMode::Repeated, Duration::from_secs(2), || post(Event::Tick));
@@ -274,43 +307,6 @@ pub fn run() {
             log!("cannot restart: {e}");
         }
     }
-}
-
-/// Looks for a newer release in the background and stages it for the next start.
-fn start_update_check() {
-    let (enabled, root) = APP.with(|cell| {
-        let app = cell.borrow();
-        let app = app.as_ref().expect("app exists before the event loop runs");
-        (app.cfg.auto_update, app.paths.root.clone())
-    });
-    if !enabled {
-        return;
-    }
-    std::thread::spawn(move || {
-        let current = env!("CARGO_PKG_VERSION");
-        match update::check(current) {
-            Ok(Some(release)) => {
-                log!("update available: {}", release.version);
-                match update::download(&release, &root) {
-                    Ok(()) => {
-                        log!("update {} downloaded", release.version);
-                        let version = release.version.clone();
-                        let _ = slint::invoke_from_event_loop(move || {
-                            APP.with(|cell| {
-                                if let Some(app) = cell.borrow_mut().as_mut() {
-                                    app.ui.set_notice(format!("已下載新版 {version}，重新啟動 LiteBrowser 即可更新。").into());
-                                    app.ui.set_update_ready(true);
-                                }
-                            });
-                        });
-                    }
-                    Err(e) => log!("update download failed: {e}"),
-                }
-            }
-            Ok(None) => log!("no update available"),
-            Err(e) => log!("update check failed: {e}"),
-        }
-    });
 }
 
 /// Starts the MCP endpoint when it is enabled, and records the URL an LLM client should use.
@@ -459,11 +455,12 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_open_log_file(|| ui_post(UiEvent::OpenLogFile));
     ui.on_make_default_browser(|| ui_post(UiEvent::MakeDefaultBrowser));
     ui.on_restart_to_update(|| ui_post(UiEvent::RestartToUpdate));
+    ui.on_check_update(|| ui_post(UiEvent::CheckUpdate));
     ui.on_save_settings(|s| ui_post(UiEvent::SaveSettings(s)));
     ui.on_dismiss_notice(|| ui_post(UiEvent::DismissNotice));
     ui.on_content_geometry_changed(|| ui_post(UiEvent::GeometryChanged));
     ui.on_toggle_devtools(|| ui_post(UiEvent::ToggleDevtools));
-    ui.on_devtools_dock_menu(|| ui_post(UiEvent::DevtoolsDockMenu));
+    ui.on_devtools_dock_to(|side| ui_post(UiEvent::DockDevtools(side)));
     ui.on_minimize_window(|| ui_post(UiEvent::MinimizeWindow));
     ui.on_toggle_maximize_window(|| ui_post(UiEvent::ToggleMaximizeWindow));
     ui.on_close_window(|| ui_post(UiEvent::CloseWindow));
@@ -684,6 +681,8 @@ struct App {
     logged_window_state: String,
     /// Start again once the event loop ends, so a downloaded update gets installed.
     restart: bool,
+    /// An update check (and download) is running in the background.
+    update_checking: bool,
 }
 
 impl App {
@@ -770,6 +769,7 @@ impl App {
             last_tick_ms: 0,
             logged_window_state: String::new(),
             restart: false,
+            update_checking: false,
         };
         if let Some(e) = cfg_error {
             log!("{e}");
@@ -783,7 +783,7 @@ impl App {
         if !app.cfg.restore_session {
             session.tabs.clear();
         }
-        for t in session.tabs.iter().filter(|t| !t.url.is_empty()) {
+        for t in &session.tabs {
             let idx = app.push_tab(t.url.clone(), t.title.clone());
             app.tabs[idx].pinned = t.pinned;
         }
@@ -799,10 +799,12 @@ impl App {
         app.reorder_pinned_first();
         let active = session.active.min(app.tabs.len() - 1);
         app.ui.set_settings(app.settings_data());
-        app.ui.set_devtools_right(app.cfg.devtools_dock_right);
         app.ui.set_window_maximized(app.ui.window().is_maximized());
         app.refresh_bookmarks();
         app.activate(active);
+        if app.cfg.auto_update {
+            app.check_for_update();
+        }
         app
     }
 
@@ -829,6 +831,8 @@ impl App {
             Event::DevtoolsViewCreated(result) => self.on_devtools_view_created(result),
             Event::ExtensionHostCreated(result) => self.on_extension_host_created(result),
             Event::RendererFrames(renderers) => self.on_renderer_frames(renderers),
+            Event::Update(step) => self.on_update(step),
+            Event::RepaintAll => self.ui.set_repaint(!self.ui.get_repaint()),
             Event::Tick => self.tick(),
         }
     }
@@ -934,13 +938,14 @@ impl App {
 
     fn save_session(&mut self) {
         self.capture_window_state();
+        // New tab pages come back too, like Chrome's; private tabs never do.
         let tabs: Vec<SessionTab> = self
             .tabs
             .iter()
-            .filter(|t| !t.url.is_empty() && !t.private)
+            .filter(|t| !t.private)
             .map(|t| SessionTab { url: t.url.clone(), title: t.title.clone(), pinned: t.pinned })
             .collect();
-        let active = self.tabs.iter().take(self.active).filter(|t| !t.url.is_empty()).count();
+        let active = self.tabs.iter().take(self.active).filter(|t| !t.private).count();
         let (tabs, active) = if self.forget_session { (Vec::new(), 0) } else { (tabs, active) };
         Session { tabs, active, window: self.window_state.clone() }.save(&self.paths.session());
         self.session_dirty = false;
@@ -1089,13 +1094,14 @@ impl App {
                 self.restart = true;
                 self.quit("restarting to install the downloaded update");
             }
+            UiEvent::CheckUpdate => self.check_for_update(),
             UiEvent::DismissNotice => {
                 self.ui.set_notice(SharedString::new());
                 self.ui.set_update_ready(false);
             }
             UiEvent::GeometryChanged => self.layout_views(),
             UiEvent::ToggleDevtools => self.toggle_devtools(),
-            UiEvent::DevtoolsDockMenu => self.devtools_dock_menu(),
+            UiEvent::DockDevtools(side) => self.set_devtools_side(devtools_dock(side)),
             UiEvent::MinimizeWindow => self.ui.window().set_minimized(true),
             UiEvent::ToggleMaximizeWindow => {
                 let maximized = !self.ui.window().is_maximized();
@@ -1995,15 +2001,14 @@ impl App {
         self.ui.set_address(url.into());
     }
 
-    /// Switches to the internal page's tab, opening one if there is none. A blank new tab turns
-    /// into it rather than staying behind empty, like Chrome.
+    /// Switches to the internal page's tab, opening one if there is none. A blank new tab is left
+    /// as it is: the user opened it for something else.
     fn show_page(&mut self, page: Page) {
         let Some(&(_, url, _)) = INTERNAL_PAGES.iter().find(|p| p.0 == page) else { return };
         let idx = match self.tabs.iter().position(|t| t.url == url) {
             Some(idx) => idx,
             None => {
-                let blank = self.tabs[self.active].url.is_empty() && !self.tabs[self.active].private;
-                let idx = if blank { self.active } else { self.push_tab(String::new(), String::new()) };
+                let idx = self.push_tab(String::new(), String::new());
                 self.load(idx, url.to_string());
                 idx
             }
@@ -2022,7 +2027,8 @@ impl App {
             restore_session: self.cfg.restore_session,
             show_bookmarks_bar: self.cfg.show_bookmarks_bar,
             search_url: self.cfg.search_url.clone().into(),
-            devtools_dock_right: self.cfg.devtools_dock_right,
+            devtools_dock: dock_side(self.cfg.devtools_dock),
+            auto_update: self.cfg.auto_update,
             mcp_enabled: self.cfg.mcp_enabled,
             mcp_host: self.cfg.mcp_host.clone().into(),
             mcp_port: self.cfg.mcp_port as i32,
@@ -2043,7 +2049,8 @@ impl App {
             restore_session: s.restore_session,
             show_bookmarks_bar: s.show_bookmarks_bar,
             search_url: s.search_url.to_string(),
-            devtools_dock_right: s.devtools_dock_right,
+            devtools_dock: devtools_dock(s.devtools_dock),
+            auto_update: s.auto_update,
             mcp_enabled: s.mcp_enabled,
             mcp_host: s.mcp_host.to_string(),
             mcp_port: s.mcp_port.clamp(0, u16::MAX as i32) as u16,
@@ -2072,7 +2079,6 @@ impl App {
                 }
             }
         }
-        self.ui.set_devtools_right(self.cfg.devtools_dock_right);
         self.layout_views();
         if old.dark_mode != self.cfg.dark_mode {
             for view in self.tabs.iter().filter_map(|t| t.view.as_ref()) {
@@ -2281,6 +2287,71 @@ impl App {
             }
             None => self.ui.set_extensions_message(NO_EXTENSION_PROFILE.into()),
         }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // Updates
+
+    /// Looks for a newer release in the background and stages it for the next start: at startup
+    /// when auto_update is on, and whenever the settings page asks.
+    fn check_for_update(&mut self) {
+        // One at a time; and once a build is staged, the next step is a restart, not another download.
+        if self.update_checking || !self.ui.get_update_downloaded().is_empty() {
+            return;
+        }
+        self.update_checking = true;
+        self.ui.set_update_checking(true);
+        self.ui.set_update_status("正在檢查…".into());
+        let root = self.paths.root.clone();
+        std::thread::spawn(move || {
+            let report = |step: UpdateStep| {
+                let _ = slint::invoke_from_event_loop(move || post(Event::Update(step)));
+            };
+            match update::check(env!("CARGO_PKG_VERSION")) {
+                Ok(Some(release)) => {
+                    log!("update available: {}", release.version);
+                    report(UpdateStep::Downloading(release.version.clone()));
+                    match update::download(&release, &root) {
+                        Ok(()) => {
+                            log!("update {} downloaded", release.version);
+                            report(UpdateStep::Ready(release.version));
+                        }
+                        Err(e) => {
+                            log!("update download failed: {e}");
+                            report(UpdateStep::Failed(format!("下載失敗：{e}")));
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log!("no update available");
+                    report(UpdateStep::UpToDate);
+                }
+                Err(e) => {
+                    log!("update check failed: {e}");
+                    report(UpdateStep::Failed(format!("檢查失敗：{e}")));
+                }
+            }
+        });
+    }
+
+    fn on_update(&mut self, step: UpdateStep) {
+        let status = match step {
+            UpdateStep::Downloading(version) => {
+                self.ui.set_update_status(format!("正在下載 {version}…").into());
+                return;
+            }
+            UpdateStep::Ready(version) => {
+                self.ui.set_notice(format!("已下載新版 {version}，重新啟動 LiteBrowser 即可更新。").into());
+                self.ui.set_update_ready(true);
+                self.ui.set_update_downloaded(version.clone().into());
+                format!("已下載 {version}，重新啟動即可更新")
+            }
+            UpdateStep::UpToDate => "已是最新版本".to_string(),
+            UpdateStep::Failed(e) => e,
+        };
+        self.ui.set_update_status(status.into());
+        self.update_checking = false;
+        self.ui.set_update_checking(false);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -3077,6 +3148,7 @@ impl App {
         // DevTools gets a dummy tab id (0) — it never participates in the memory policy.
         match result.and_then(|c| WebView::attach(c, &env, 0, None).map_err(|e| e.message().to_string())) {
             Ok(view) => {
+                view.add_startup_script(devtools::FRONTEND_DEFAULTS_SCRIPT);
                 if let Some(url) = self.pending_devtools_url.take() {
                     view.navigate(&url);
                 }
@@ -3176,30 +3248,12 @@ impl App {
         slint::quit_event_loop().ok();
     }
 
-    /// Right-clicking the DevTools splitter offers the dock side (and closing it).
-    fn devtools_dock_menu(&mut self) {
-        let right = self.cfg.devtools_dock_right;
-        let menu = vec![
-            MenuItem::entry(1, if right { "停駐在下方" } else { "停駐在下方（目前）" }),
-            MenuItem::entry(2, if right { "停駐在右側（目前）" } else { "停駐在右側" }),
-            MenuItem::Separator,
-            MenuItem::entry(3, "關閉開發人員工具"),
-        ];
-        match platform::popup_menu(&menu) {
-            1 => self.set_devtools_side(false),
-            2 => self.set_devtools_side(true),
-            3 => self.close_devtools(),
-            _ => {}
-        }
-    }
-
-    fn set_devtools_side(&mut self, right: bool) {
-        if self.cfg.devtools_dock_right == right {
+    fn set_devtools_side(&mut self, dock: DevtoolsDock) {
+        if self.cfg.devtools_dock == dock {
             return;
         }
-        self.cfg.devtools_dock_right = right;
+        self.cfg.devtools_dock = dock;
         let _ = self.cfg.save(&self.paths.config());
-        self.ui.set_devtools_right(right);
         self.ui.set_settings(self.settings_data());
         self.layout_views();
     }

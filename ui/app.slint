@@ -11,6 +11,9 @@ import { LineEdit, ListView, ScrollView, CheckBox, SpinBox, Palette } from "std-
 
 export enum Page { web, new-tab, bookmarks, history, extensions, settings, import }
 
+// Where docked DevTools sit beside the page.
+export enum DockSide { bottom, left, right }
+
 export struct TabData {
     title: string,
     url: string,
@@ -75,7 +78,8 @@ export struct SettingsData {
     restore-session: bool,
     show-bookmarks-bar: bool,
     search-url: string,
-    devtools-dock-right: bool,
+    devtools-dock: DockSide,
+    auto-update: bool,
     mcp-enabled: bool,
     mcp-host: string,
     mcp-port: int,
@@ -151,6 +155,10 @@ global Icons {
     out property <string> caption-restore: "M 0.5 2.5 L 7.5 2.5 L 7.5 9.5 L 0.5 9.5 Z M 2.5 2.5 L 2.5 0.5 L 9.5 0.5 L 9.5 7.5 L 7.5 7.5";
     out property <string> caption-close: "M 0.5 0.5 L 9.5 9.5 M 9.5 0.5 L 0.5 9.5";
     out property <string> devtools: "M 4 5 L 20 5 L 20 19 L 4 19 Z M 4 10 L 20 10 M 8 14 L 11 14";
+    // A window with the DevTools pane split off on that side, as in Chrome's dock menu.
+    out property <string> dock-left: "M 4 5 L 20 5 L 20 19 L 4 19 Z M 10 5 L 10 19";
+    out property <string> dock-bottom: "M 4 5 L 20 5 L 20 19 L 4 19 Z M 4 13 L 20 13";
+    out property <string> dock-right: "M 4 5 L 20 5 L 20 19 L 4 19 Z M 14 5 L 14 19";
 }
 
 // Round toolbar button with Chrome's 34px circular hover.
@@ -1016,6 +1024,104 @@ component EmptyText inherits Text {
     wrap: word-wrap;
 }
 
+// One place DevTools can dock: a strip with the dock and close buttons, and under it the slot the
+// DevTools WebView covers. The strip is ours because the frontend runs hosted (served by the
+// remote-debugging server), and hosted DevTools show neither a dock menu nor a close button.
+component DevtoolsPane inherits VerticalLayout {
+    // DevTools are docked here; otherwise the pane collapses to nothing.
+    in property <bool> shown;
+    in property <DockSide> side;
+    out property <length> slot-x: slot.absolute-position.x;
+    out property <length> slot-y: slot.absolute-position.y;
+    out property <length> slot-width: slot.width;
+    out property <length> slot-height: slot.height;
+    callback dock-to(DockSide);
+    callback close();
+    callback geometry-changed();
+
+    // Children placed by hand rather than by a layout, so the strip adds nothing to the pane's
+    // minimum width and the splitter's ratio stays the stretch ratio.
+    if root.shown: Rectangle {
+        height: 30px;
+        background: Theme.surface;
+
+        Path {
+            x: 10px;
+            y: (parent.height - self.height) / 2;
+            width: 16px;
+            height: 16px;
+            viewbox-width: 24;
+            viewbox-height: 24;
+            commands: Icons.devtools;
+            stroke: Theme.icon;
+            stroke-width: 1.5px;
+            stroke-line-cap: round;
+            stroke-line-join: round;
+        }
+
+        Text {
+            x: 34px;
+            width: max(0px, close-button.x - 4 * 28px - 34px);
+            height: parent.height;
+            text: "開發人員工具";
+            font-size: 12px;
+            color: Theme.dim;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+
+        for d[i] in [DockSide.left, DockSide.bottom, DockSide.right]: IconButton {
+            x: close-button.x - 9px - (3 - i) * 28px;
+            y: (parent.height - self.height) / 2;
+            size: 26px;
+            icon-size: 16px;
+            icon: d == DockSide.left ? Icons.dock-left : d == DockSide.bottom ? Icons.dock-bottom : Icons.dock-right;
+            active: d == root.side;
+            clicked => {
+                root.dock-to(d);
+            }
+        }
+
+        Rectangle {
+            x: close-button.x - 6px;
+            y: (parent.height - self.height) / 2;
+            width: 1px;
+            height: 16px;
+            background: Theme.separator;
+        }
+
+        close-button := IconButton {
+            x: parent.width - self.width - 4px;
+            y: (parent.height - self.height) / 2;
+            size: 26px;
+            icon-size: 16px;
+            icon: Icons.close;
+            clicked => {
+                root.close();
+            }
+        }
+
+        Rectangle {
+            y: parent.height - 1px;
+            height: 1px;
+            background: Theme.border;
+        }
+    }
+
+    slot := Rectangle {
+        vertical-stretch: 1;
+        changed width => {
+            root.geometry-changed();
+        }
+        changed height => {
+            root.geometry-changed();
+        }
+        changed absolute-position => {
+            root.geometry-changed();
+        }
+    }
+}
+
 export component AppWindow inherits Window {
     // ---- state pushed from Rust ----
     in property <[TabData]> tabs;
@@ -1067,24 +1173,32 @@ export component AppWindow inherits Window {
     in-out property <int> editing-bookmark: -1;
     in property <string> import-message;
 
+    // Where the last update check got to ("已是最新版本", "正在下載 v0.3.0…"), for the settings page.
+    in property <string> update-status;
+    in property <bool> update-checking;
+    // The version downloaded and waiting for a restart, or "".
+    in property <string> update-downloaded;
+    // Flipped to repaint the whole window; see the Rectangle at the end.
+    in property <bool> repaint;
+
     // ---- geometry of the web content area in logical pixels, read by Rust ----
     // The page WebView fills `web-slot` (the whole content area, or what is left of it when DevTools
-    // is docked); the DevTools WebView fills whichever dock slot is active. Rust reads these to
-    // position both native views.
+    // is docked); the DevTools WebView fills the slot of the pane on the docked side. Rust reads
+    // these to position both native views.
     out property <length> web-view-x: web-slot.absolute-position.x;
     out property <length> web-view-y: web-slot.absolute-position.y;
     out property <length> web-view-width: web-slot.width;
     out property <length> web-view-height: web-slot.height;
-    out property <length> devtools-x: root.devtools-right ? devtools-side.absolute-position.x : devtools-bottom.absolute-position.x;
-    out property <length> devtools-y: root.devtools-right ? devtools-side.absolute-position.y : devtools-bottom.absolute-position.y;
-    out property <length> devtools-width: root.devtools-right ? devtools-side.width : devtools-bottom.width;
-    out property <length> devtools-height: root.devtools-right ? devtools-side.height : devtools-bottom.height;
+    property <DockSide> dock: root.settings.devtools-dock;
+    out property <length> devtools-x: root.dock == DockSide.left ? devtools-left.slot-x : root.dock == DockSide.right ? devtools-right.slot-x : devtools-bottom.slot-x;
+    out property <length> devtools-y: root.dock == DockSide.left ? devtools-left.slot-y : root.dock == DockSide.right ? devtools-right.slot-y : devtools-bottom.slot-y;
+    out property <length> devtools-width: root.dock == DockSide.left ? devtools-left.slot-width : root.dock == DockSide.right ? devtools-right.slot-width : devtools-bottom.slot-width;
+    out property <length> devtools-height: root.dock == DockSide.left ? devtools-left.slot-height : root.dock == DockSide.right ? devtools-right.slot-height : devtools-bottom.slot-height;
     // True while a page is playing full screen, or the user pressed F11: every piece of
     // browser chrome goes away and the page gets the whole window.
     in property <bool> fullscreen;
     in property <bool> devtools-open;
-    // false = docked at the bottom, true = docked on the right.
-    in property <bool> devtools-right;
+    // The docked pane's share of the content area, along the split.
     in-out property <float> devtools-fraction: 0.4;
 
     // ---- callbacks into Rust ----
@@ -1135,15 +1249,18 @@ export component AppWindow inherits Window {
     callback open-data-folder();
     callback open-log-file();
     callback make-default-browser();
-    // The update notice's "restart now".
+    // The update notice's and the settings page's "restart now".
     callback restart-to-update();
+    // The settings page's 檢查更新.
+    callback check-update();
     callback save-settings(SettingsData);
     callback dismiss-notice();
     callback refresh-import();
     callback import-run(bool, bool);
     callback import-passwords-csv();
     callback toggle-devtools();
-    callback devtools-dock-menu();
+    // A dock button on the DevTools strip.
+    callback devtools-dock-to(DockSide);
 
     public function end-tab-drag() {
         tab-strip.drag-index = -1;
@@ -1706,17 +1823,56 @@ export component AppWindow inherits Window {
                 vertical-stretch: 1;
                 background: Theme.surface;
                 property <bool> dock: root.devtools-open && root.page == Page.web;
-                property <bool> dock-bottom: content.dock && !root.devtools-right;
-                property <bool> dock-side: content.dock && root.devtools-right;
+                property <bool> dock-bottom: content.dock && root.dock == DockSide.bottom;
+                property <bool> dock-left: content.dock && root.dock == DockSide.left;
+                property <bool> dock-right: content.dock && root.dock == DockSide.right;
                 property <float> frac: clamp(root.devtools-fraction, 0.15, 0.8);
 
-                // WebView host slots. The page WebView always covers `web-slot`; DevTools covers
-                // `devtools-bottom` or `devtools-side` depending on where it is docked. The splits are
-                // driven by stretch factors (not by referencing content.width/height, which would
-                // create a layout binding loop). The inactive slot gets stretch 0, so it collapses.
+                // WebView host slots. The page WebView always covers `web-slot`; DevTools covers the
+                // slot of the pane on its side. The splits are driven by stretch factors (not by
+                // referencing content.width/height, which would create a layout binding loop). The
+                // panes that are not in use get stretch 0, so they collapse.
                 HorizontalLayout {
+                    devtools-left := DevtoolsPane {
+                        shown: content.dock-left;
+                        side: root.dock;
+                        horizontal-stretch: content.dock-left ? content.frac : 0;
+                        dock-to(side) => {
+                            root.devtools-dock-to(side);
+                        }
+                        close => {
+                            root.toggle-devtools();
+                        }
+                        geometry-changed => {
+                            root.content-geometry-changed();
+                        }
+                    }
+
+                    // Splitter right of a left-docked DevTools.
+                    Rectangle {
+                        width: content.dock-left ? 6px : 0px;
+                        horizontal-stretch: 0;
+                        background: left-splitter.has-hover ? Theme.accent : Theme.border;
+                        left-splitter := TouchArea {
+                            mouse-cursor: col-resize;
+                            property <float> start-fraction;
+                            pointer-event(e) => {
+                                if (e.kind == PointerEventKind.down) {
+                                    self.start-fraction = root.devtools-fraction;
+                                }
+                            }
+                            moved => {
+                                if (content.dock-left && self.pressed) {
+                                    root.devtools-fraction = clamp(
+                                        self.start-fraction + (self.mouse-x - self.pressed-x) / max(1px, content.width),
+                                        0.15, 0.8);
+                                }
+                            }
+                        }
+                    }
+
                     VerticalLayout {
-                        horizontal-stretch: content.dock-side ? 1 - content.frac : 1;
+                        horizontal-stretch: content.dock-left || content.dock-right ? 1 - content.frac : 1;
 
                         web-slot := Rectangle {
                             vertical-stretch: content.dock-bottom ? 1 - content.frac : 1;
@@ -1743,8 +1899,6 @@ export component AppWindow inherits Window {
                                 pointer-event(e) => {
                                     if (e.kind == PointerEventKind.down) {
                                         self.start-fraction = root.devtools-fraction;
-                                    } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
-                                        root.devtools-dock-menu();
                                     }
                                 }
                                 moved => {
@@ -1757,12 +1911,17 @@ export component AppWindow inherits Window {
                             }
                         }
 
-                        devtools-bottom := Rectangle {
+                        devtools-bottom := DevtoolsPane {
+                            shown: content.dock-bottom;
+                            side: root.dock;
                             vertical-stretch: content.dock-bottom ? content.frac : 0;
-                            changed height => {
-                                root.content-geometry-changed();
+                            dock-to(side) => {
+                                root.devtools-dock-to(side);
                             }
-                            changed absolute-position => {
+                            close => {
+                                root.toggle-devtools();
+                            }
+                            geometry-changed => {
                                 root.content-geometry-changed();
                             }
                         }
@@ -1770,21 +1929,19 @@ export component AppWindow inherits Window {
 
                     // Splitter left of a right-docked DevTools.
                     Rectangle {
-                        width: content.dock-side ? 6px : 0px;
+                        width: content.dock-right ? 6px : 0px;
                         horizontal-stretch: 0;
-                        background: side-splitter.has-hover ? Theme.accent : Theme.border;
-                        side-splitter := TouchArea {
+                        background: right-splitter.has-hover ? Theme.accent : Theme.border;
+                        right-splitter := TouchArea {
                             mouse-cursor: col-resize;
                             property <float> start-fraction;
                             pointer-event(e) => {
                                 if (e.kind == PointerEventKind.down) {
                                     self.start-fraction = root.devtools-fraction;
-                                } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
-                                    root.devtools-dock-menu();
                                 }
                             }
                             moved => {
-                                if (content.dock-side && self.pressed) {
+                                if (content.dock-right && self.pressed) {
                                     root.devtools-fraction = clamp(
                                         self.start-fraction - (self.mouse-x - self.pressed-x) / max(1px, content.width),
                                         0.15, 0.8);
@@ -1793,12 +1950,17 @@ export component AppWindow inherits Window {
                         }
                     }
 
-                    devtools-side := Rectangle {
-                        horizontal-stretch: content.dock-side ? content.frac : 0;
-                        changed width => {
-                            root.content-geometry-changed();
+                    devtools-right := DevtoolsPane {
+                        shown: content.dock-right;
+                        side: root.dock;
+                        horizontal-stretch: content.dock-right ? content.frac : 0;
+                        dock-to(side) => {
+                            root.devtools-dock-to(side);
                         }
-                        changed absolute-position => {
+                        close => {
+                            root.toggle-devtools();
+                        }
+                        geometry-changed => {
                             root.content-geometry-changed();
                         }
                     }
@@ -2281,9 +2443,14 @@ export component AppWindow inherits Window {
                 if root.page == Page.settings: settings-page := Rectangle {
                     background: Theme.page;
                     property <int> log-level: root.settings.log-level;
+                    property <DockSide> devtools-dock: root.settings.devtools-dock;
 
                     function set-log-level(level: int) {
                         self.log-level = level;
+                        self.save();
+                    }
+                    function set-devtools-dock(side: DockSide) {
+                        self.devtools-dock = side;
                         self.save();
                     }
                     function save() {
@@ -2297,7 +2464,8 @@ export component AppWindow inherits Window {
                             restore-session: restore.checked,
                             show-bookmarks-bar: bar.checked,
                             search-url: search.text,
-                            devtools-dock-right: devtools-dock.checked,
+                            devtools-dock: settings-page.devtools-dock,
+                            auto-update: auto-update.checked,
                             mcp-enabled: mcp.checked,
                             mcp-host: mcp-host.text,
                             mcp-port: mcp-port.value,
@@ -2599,12 +2767,72 @@ export component AppWindow inherits Window {
                                     Divider { }
 
                                     SettingRow {
-                                        label: "開發人員工具停駐在右側";
-                                        sub: "預設在下方；也可以在分隔線上按右鍵切換";
-                                        devtools-dock := Toggle {
-                                            checked: root.settings.devtools-dock-right;
+                                        label: "開發人員工具的位置";
+                                        sub: "也可以用開發人員工具上方的按鈕切換";
+                                        HorizontalLayout {
+                                            spacing: 8px;
+                                            PillButton {
+                                                text: "左側";
+                                                primary: settings-page.devtools-dock == DockSide.left;
+                                                clicked => {
+                                                    settings-page.set-devtools-dock(DockSide.left);
+                                                }
+                                            }
+
+                                            PillButton {
+                                                text: "下方";
+                                                primary: settings-page.devtools-dock == DockSide.bottom;
+                                                clicked => {
+                                                    settings-page.set-devtools-dock(DockSide.bottom);
+                                                }
+                                            }
+
+                                            PillButton {
+                                                text: "右側";
+                                                primary: settings-page.devtools-dock == DockSide.right;
+                                                clicked => {
+                                                    settings-page.set-devtools-dock(DockSide.right);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            SectionTitle {
+                                text: "更新";
+                            }
+
+                            Card {
+                                VerticalLayout {
+                                    SettingRow {
+                                        label: "自動更新";
+                                        sub: "啟動時到 GitHub 檢查新版，有的話在背景下載，重新啟動後換上";
+                                        auto-update := Toggle {
+                                            checked: root.settings.auto-update;
                                             toggled => {
                                                 settings-page.save();
+                                            }
+                                        }
+                                    }
+
+                                    Divider { }
+
+                                    SettingRow {
+                                        label: "目前版本 " + root.app-version;
+                                        sub: root.update-status;
+                                        if root.update-downloaded == "": PillButton {
+                                            text: root.update-checking ? "檢查中…" : "檢查更新";
+                                            enabled: !root.update-checking;
+                                            clicked => {
+                                                root.check-update();
+                                            }
+                                        }
+                                        if root.update-downloaded != "": PillButton {
+                                            text: "立即重新啟動";
+                                            primary: true;
+                                            clicked => {
+                                                root.restart-to-update();
                                             }
                                         }
                                     }
@@ -2928,5 +3156,13 @@ export component AppWindow inherits Window {
                 }
             }
         }
+    }
+
+    // Draws nothing. The software renderer puts on screen only what it changed itself, so chrome
+    // it painted while a WebView window still covered the spot stayed blank once that window moved
+    // away (the DevTools strip after switching sides). Flipping `repaint` makes it paint and show
+    // the whole window again; Rust does that when Windows asks for such a spot (win.rs, WM_PAINT).
+    Rectangle {
+        background: root.repaint ? #ffffff00 : #00000000;
     }
 }

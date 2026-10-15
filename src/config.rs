@@ -3,6 +3,14 @@
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DevtoolsDock {
+    Bottom,
+    Left,
+    Right,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -26,8 +34,8 @@ pub struct Config {
     /// Pass `--disable-gpu` to WebView2. Saves a process, but some sites' bot checks need WebGL,
     /// so this is off by default. Needs a restart.
     pub disable_gpu: bool,
-    /// Dock DevTools on the right instead of the bottom.
-    pub devtools_dock_right: bool,
+    /// Which side of the page DevTools dock on.
+    pub devtools_dock: DevtoolsDock,
     /// Check GitHub for a newer release at startup and stage it for the next start.
     pub auto_update: bool,
     /// Serve an MCP endpoint so an LLM can drive the browser. Needs a restart.
@@ -60,7 +68,7 @@ impl Default for Config {
             low_memory_free_mb: 250,
             adblock: true,
             disable_gpu: false,
-            devtools_dock_right: false,
+            devtools_dock: DevtoolsDock::Bottom,
             auto_update: true,
             mcp_enabled: false,
             mcp_host: "127.0.0.1".into(),
@@ -147,6 +155,14 @@ mod tests {
         let cfg = Config { adblock: false, ..Config::default() };
         let text = toml::to_string_pretty(&cfg).unwrap();
         assert_eq!(toml::from_str::<Config>(&text).unwrap(), cfg);
+    }
+
+    #[test]
+    fn devtools_dock_is_the_word_users_type() {
+        // README tells users to write these words into config.toml.
+        let cfg: Config = toml::from_str(r#"devtools_dock = "left""#).unwrap();
+        assert_eq!(cfg.devtools_dock, DevtoolsDock::Left);
+        assert!(toml::to_string(&Config::default()).unwrap().contains(r#"devtools_dock = "bottom""#));
     }
 
     #[test]
