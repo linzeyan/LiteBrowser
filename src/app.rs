@@ -1115,8 +1115,17 @@ impl App {
             UiEvent::OpenUrlFromOtherInstance(url) => {
                 // A link clicked in another app: the window comes up front, like Chrome's.
                 if let Some(hwnd) = self.hwnd {
-                    win::bring_to_front(hwnd);
+                    // Users start LiteBrowser again when they cannot find its window, so this is
+                    // where a "vanished" window shows what state it was really in.
+                    let before = win::window_state(hwnd);
+                    let foreground = win::bring_to_front(hwnd);
                     win::focus_main_window(hwnd);
+                    log!(
+                        "another launch{}: window was {before}; foreground {}; now {}",
+                        if url.is_empty() { String::new() } else { " opened a URL".into() },
+                        if foreground { "granted" } else { "refused" },
+                        win::window_state(hwnd)
+                    );
                 }
                 if let Some(url) = url_input::to_url(&url, &self.cfg.search_url) {
                     let at = self.active + 1;
@@ -3078,12 +3087,22 @@ impl App {
             self.close_devtools();
             return;
         }
-        if self.page() != Page::Web || self.tabs[self.active].view.is_none() {
-            self.set_status("請先開啟網頁再使用開發人員工具");
-            return;
+        match self.page() {
+            // The new-tab page is drawn by us, with nothing to inspect: give the tab a blank page
+            // (as Chrome does for about:blank) and let it open once that page has loaded.
+            Page::NewTab => {
+                self.devtools_tabs.insert(id);
+                self.navigate_active("about:blank".into());
+            }
+            Page::Web => {
+                self.devtools_tabs.insert(id);
+                // A page still being created opens it when it has loaded (reopen_devtools).
+                if self.tabs[self.active].view.is_some() {
+                    self.open_devtools();
+                }
+            }
+            _ => self.set_status("請先開啟網頁再使用開發人員工具"),
         }
-        self.devtools_tabs.insert(id);
-        self.open_devtools();
     }
 
     /// Brings back the DevTools the active tab had open, once its page is there to attach to (a

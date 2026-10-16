@@ -226,14 +226,14 @@ pub fn window_state(hwnd: HWND) -> String {
 }
 
 /// Restores the window if it is minimized and puts it in front. Only works while we may take the
-/// foreground, e.g. right after a second launch allowed it.
-pub fn bring_to_front(hwnd: HWND) {
+/// foreground, e.g. right after a second launch allowed it. Returns whether Windows let us.
+pub fn bring_to_front(hwnd: HWND) -> bool {
     use windows::Win32::UI::WindowsAndMessaging::{IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE};
     unsafe {
         if IsIconic(hwnd).as_bool() {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
-        let _ = SetForegroundWindow(hwnd);
+        SetForegroundWindow(hwnd).as_bool()
     }
 }
 

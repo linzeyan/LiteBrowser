@@ -6,6 +6,10 @@ pub fn to_url(input: &str, search_url: &str) -> Option<String> {
     if text.is_empty() {
         return None;
     }
+    // "Open with" and a second launch hand us a file path, and so does pasting one from Explorer.
+    if let Some(url) = file_url(text.trim_matches('"')) {
+        return Some(url);
+    }
     if has_scheme(text) {
         return Some(text.to_string());
     }
@@ -19,6 +23,30 @@ pub fn to_url(input: &str, search_url: &str) -> Option<String> {
         }
     }
     Some(search_url.replace("{}", &encode_query(text)))
+}
+
+/// `file:` URL for an absolute Windows path: `C:\dir\a.pdf`, `C:/dir/a.pdf` or `\\server\share\a`.
+fn file_url(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let drive = bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && matches!(bytes[2], b'\\' | b'/');
+    let unc = text.starts_with(r"\\");
+    if !drive && !unc {
+        return None;
+    }
+    // Only what would end or change the URL is escaped; the engine encodes the rest itself.
+    let path: String = text
+        .trim_start_matches('\\')
+        .chars()
+        .map(|c| match c {
+            '\\' => "/".to_string(),
+            '%' => "%25".to_string(),
+            ' ' => "%20".to_string(),
+            '#' => "%23".to_string(),
+            '?' => "%3F".to_string(),
+            c => c.to_string(),
+        })
+        .collect();
+    Some(if unc { format!("file://{path}") } else { format!("file:///{path}") })
 }
 
 fn has_scheme(text: &str) -> bool {
@@ -153,6 +181,18 @@ mod tests {
         assert_eq!(url("1.5"), "https://www.google.com/search?q=1.5");
         assert_eq!(url("記憶體"), "https://www.google.com/search?q=%E8%A8%98%E6%86%B6%E9%AB%94");
         assert_eq!(url("what is a.b c"), "https://www.google.com/search?q=what+is+a.b+c");
+    }
+
+    #[test]
+    fn windows_paths_open_as_files() {
+        // A PDF opened from Explorer arrives as a bare path; searching Google for it is useless.
+        assert_eq!(url(r"C:\Users\ricky\Downloads\a.pdf"), "file:///C:/Users/ricky/Downloads/a.pdf");
+        assert_eq!(url(r#""D:\報告 2026\q#3.pdf""#), "file:///D:/報告%202026/q%233.pdf");
+        assert_eq!(url("C:/tmp/a.html"), "file:///C:/tmp/a.html");
+        assert_eq!(url(r"\\nas\share\a.pdf"), "file://nas/share/a.pdf");
+        // Not paths: a drive letter alone, and a host:port.
+        assert_eq!(url("c:"), "https://www.google.com/search?q=c%3A");
+        assert_eq!(url("localhost:3000"), "http://localhost:3000");
     }
 
     #[test]
