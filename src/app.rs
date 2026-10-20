@@ -6,7 +6,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -148,6 +148,7 @@ pub enum UiEvent {
     ReloadExtensions,
     OpenDataFolder,
     OpenLogFile,
+    EditBlocklist,
     MakeDefaultBrowser,
     /// The notice's or the settings page's 立即重新啟動 after an update was downloaded.
     RestartToUpdate,
@@ -453,6 +454,7 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_reload_extensions(|| ui_post(UiEvent::ReloadExtensions));
     ui.on_open_data_folder(|| ui_post(UiEvent::OpenDataFolder));
     ui.on_open_log_file(|| ui_post(UiEvent::OpenLogFile));
+    ui.on_edit_blocklist(|| ui_post(UiEvent::EditBlocklist));
     ui.on_make_default_browser(|| ui_post(UiEvent::MakeDefaultBrowser));
     ui.on_restart_to_update(|| ui_post(UiEvent::RestartToUpdate));
     ui.on_check_update(|| ui_post(UiEvent::CheckUpdate));
@@ -1070,13 +1072,8 @@ impl App {
             UiEvent::OpenExtensionsFolder => win::shell_open(&self.paths.extensions_dir()),
             UiEvent::ReloadExtensions => self.sync_extensions(true),
             UiEvent::OpenDataFolder => win::shell_open(&self.paths.root),
-            UiEvent::OpenLogFile => {
-                // Windows 11 has no app for .log (it asks with "Open With"); Notepad reads it. Where
-                // Notepad was removed, the folder still lets the user pick the file up.
-                if std::process::Command::new("notepad.exe").arg(self.paths.log()).spawn().is_err() {
-                    win::shell_open(&self.paths.root);
-                }
-            }
+            UiEvent::OpenLogFile => self.open_in_notepad(&self.paths.log()),
+            UiEvent::EditBlocklist => self.open_in_notepad(&self.paths.blocklist()),
             UiEvent::MakeDefaultBrowser => {
                 let result = std::env::current_exe()
                     .map_err(|e| e.to_string())
@@ -1222,6 +1219,15 @@ impl App {
         }
     }
 
+    fn open_in_notepad(&self, path: &Path) {
+        // Windows 11 has no app for .log (it asks with "Open With"), and .txt may belong to an
+        // app that cannot save; Notepad reads and writes both. Where Notepad was removed, the
+        // folder still lets the user pick the file up.
+        if std::process::Command::new("notepad.exe").arg(path).spawn().is_err() {
+            win::shell_open(&self.paths.root);
+        }
+    }
+
     fn focus_address(&mut self) {
         if let Some(hwnd) = self.hwnd {
             win::focus_main_window(hwnd);
@@ -1345,6 +1351,7 @@ impl App {
                 if let Some(hwnd) = self.hwnd {
                     win::focus_main_window(hwnd);
                 }
+                self.ui.invoke_focus_shortcuts();
             }
         }
         self.reopen_devtools();
@@ -1575,6 +1582,10 @@ impl App {
         }
         self.ui.set_fullscreen(on);
         self.ui.window().set_fullscreen(on);
+        // The omnibox is hidden now; if it had the focus, F11 would no longer reach us.
+        if on {
+            self.ui.invoke_focus_shortcuts();
+        }
         // Esc is only taken from the page while *we* are the ones holding full screen; a page's
         // own full screen leaves on Esc by itself.
         webview::set_browser_fullscreen(self.user_fullscreen);

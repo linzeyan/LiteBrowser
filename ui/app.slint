@@ -1248,6 +1248,7 @@ export component AppWindow inherits Window {
     callback install-extension(string);
     callback open-data-folder();
     callback open-log-file();
+    callback edit-blocklist();
     callback make-default-browser();
     // The update notice's and the settings page's "restart now".
     callback restart-to-update();
@@ -1268,8 +1269,20 @@ export component AppWindow inherits Window {
     }
 
     public function focus-address() {
-        address-input.focus();
-        address-input.select-all();
+        // Full screen hides the omnibox, and Slint drops the focus of a hidden element.
+        if (root.fullscreen) {
+            keys.focus();
+        } else {
+            address-input.focus();
+            address-input.select-all();
+        }
+    }
+
+    // Keys reach `keys` only through a focused element inside it. When that element goes away
+    // (the omnibox hidden by full screen, a field of the internal page just left) Slint leaves
+    // nothing focused, and every shortcut, F11 included, is dropped until the user clicks a field.
+    public function focus-shortcuts() {
+        keys.focus();
     }
 
     function open-suggestion(s: SuggestionData) {
@@ -2639,11 +2652,25 @@ export component AppWindow inherits Window {
 
                                     SettingRow {
                                         label: "封鎖廣告與追蹤網域";
-                                        sub: "清單是資料夾裡的 blocklist.txt；重新啟動後生效";
-                                        adblock := Toggle {
-                                            checked: root.settings.adblock;
-                                            toggled => {
-                                                settings-page.save();
+                                        sub: "內建清單之外，可在 blocklist.txt 每行加一個網域；存檔後重新啟動生效";
+                                        HorizontalLayout {
+                                            spacing: 16px;
+                                            PillButton {
+                                                text: "編輯清單";
+                                                clicked => {
+                                                    root.edit-blocklist();
+                                                }
+                                            }
+
+                                            // Last, so it lines up with the other rows' switches.
+                                            VerticalLayout {
+                                                alignment: center;
+                                                adblock := Toggle {
+                                                    checked: root.settings.adblock;
+                                                    toggled => {
+                                                        settings-page.save();
+                                                    }
+                                                }
                                             }
                                         }
                                     }
