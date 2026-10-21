@@ -25,7 +25,7 @@ use webview2_com::{
 use windows::core::{Interface, BOOL, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::IStream;
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MBUTTON, VK_MENU, VK_SHIFT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
 
 use crate::adblock::Blocklist;
 use crate::app::{post, Event};
@@ -431,7 +431,7 @@ impl WebView {
                     // A sized/positioned window is a popup (e.g. a login dialog) that needs window.opener,
                     // so it always gets a live WebView. Ctrl/middle clicks become lazy background tabs.
                     let popup = has_size.as_bool() || has_pos.as_bool();
-                    let background = !popup && (modifiers().ctrl || key_down(VK_MBUTTON.0));
+                    let background = !popup && (modifiers().ctrl || crate::win::page_middle_click());
                     post_engine(
                         tab,
                         EngineEvent::NewWindow(NewWindowRequest {
