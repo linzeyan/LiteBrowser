@@ -1,5 +1,5 @@
 //! Process- and OS-level Windows helpers: DPAPI, system memory, single instance, app identity,
-//! native popup menus, and the file-open dialog. (Window/HWND glue lives in `win`.)
+//! native popup menus, the file-open dialog, and the clipboard. (Window/HWND glue lives in `win`.)
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -26,7 +26,7 @@ const SINGLETON_CLASS: PCWSTR = windows::core::w!("LiteBrowser_Singleton");
 pub const WM_COPYDATA_OPEN_URL: usize = 0x4C42; // 'LB'
 
 /// Decrypts a DPAPI blob (CryptUnprotectData) for the current user. Used only for LiteBrowser's
-/// own WebView2 key when writing imported passwords into our own store.
+/// own WebView2 key, to write imported passwords into our own store and show its saved ones.
 pub fn dpapi_unprotect(blob: &[u8]) -> Option<Vec<u8>> {
     unsafe {
         let input = CRYPT_INTEGER_BLOB { cbData: blob.len() as u32, pbData: blob.as_ptr() as *mut u8 };
@@ -363,6 +363,54 @@ pub fn open_csv_dialog(owner: HWND) -> Option<PathBuf> {
             None
         }
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Clipboard (the passwords page's copy button)
+
+/// Puts a password on the clipboard, kept out of Windows' clipboard history (Win+V) and cloud
+/// clipboard sync, as password managers do: it would otherwise sit there in plain text for days.
+pub fn copy_secret_to_clipboard(owner: HWND, text: &str) -> bool {
+    use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, RegisterClipboardFormatW};
+    const CF_UNICODETEXT: u32 = 13;
+    let mut wide: Vec<u16> = text.encode_utf16().collect();
+    wide.push(0);
+    unsafe {
+        if OpenClipboard(Some(owner)).is_err() {
+            return false;
+        }
+        let exclude = RegisterClipboardFormatW(windows::core::w!("ExcludeClipboardContentFromMonitorProcessing"));
+        let ok = EmptyClipboard().is_ok()
+            && exclude != 0
+            && set_clipboard_bytes(exclude, &[0u8; 4])
+            && set_clipboard_bytes(
+                CF_UNICODETEXT,
+                std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len() * 2),
+            );
+        let _ = CloseClipboard();
+        ok
+    }
+}
+
+/// Copies `bytes` into a movable global block and hands it to the clipboard, which owns it from
+/// then on; on failure the block is freed here.
+unsafe fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> bool {
+    use windows::Win32::Foundation::GlobalFree;
+    use windows::Win32::System::DataExchange::SetClipboardData;
+    use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
+    let Ok(block) = GlobalAlloc(GMEM_MOVEABLE, bytes.len()) else { return false };
+    let dst = GlobalLock(block);
+    if dst.is_null() {
+        let _ = GlobalFree(Some(block));
+        return false;
+    }
+    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.cast::<u8>(), bytes.len());
+    let _ = GlobalUnlock(block);
+    if SetClipboardData(format, Some(HANDLE(block.0))).is_err() {
+        let _ = GlobalFree(Some(block));
+        return false;
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------------------------

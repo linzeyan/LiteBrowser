@@ -38,12 +38,13 @@ const WEBVIEW2_DOWNLOAD: &str = "https://go.microsoft.com/fwlink/p/?LinkId=21247
 
 /// Internal pages are tabs whose URL names the page, so they open, switch and close like any other
 /// tab (Chrome's chrome:// pages): page, URL, tab title.
-const INTERNAL_PAGES: [(Page, &str, &str); 5] = [
+const INTERNAL_PAGES: [(Page, &str, &str); 6] = [
     (Page::Bookmarks, "litebrowser://bookmarks", "書籤"),
     (Page::History, "litebrowser://history", "歷史紀錄"),
     (Page::Extensions, "litebrowser://extensions", "擴充功能"),
     (Page::Settings, "litebrowser://settings", "設定"),
     (Page::Import, "litebrowser://import", "從其他瀏覽器匯入"),
+    (Page::Passwords, "litebrowser://passwords", "密碼"),
 ];
 
 /// The config's dock side as the UI names it, and back.
@@ -172,6 +173,10 @@ pub enum UiEvent {
     RefreshImport,
     ImportRun { bookmarks: bool, history: bool },
     ImportPasswordsCsv,
+    PasswordSearch(String),
+    /// A row's eye button on the passwords page, by index into the saved logins.
+    TogglePassword(usize),
+    CopyPassword(usize),
     /// A second launch asked this instance to open a URL.
     OpenUrlFromOtherInstance(String),
 }
@@ -355,9 +360,8 @@ fn apply_pending_password_imports(paths: &Paths) {
     if pending.password_csvs.is_empty() {
         return;
     }
-    let login_data = paths.webview_data().join("EBWebView/Default/Login Data");
-    let local_state = paths.webview_data().join("EBWebView/Local State");
-    let Some(key) = import::crypto::key_from_local_state(&local_state, &platform::dpapi_unprotect) else {
+    let login_data = login_data_path(paths);
+    let Some(key) = webview_password_key(paths) else {
         log!("pending password import deferred: WebView2 key not available yet");
         return;
     };
@@ -375,6 +379,17 @@ fn apply_pending_password_imports(paths: &Paths) {
         }
         Err(e) => log!("password import deferred: {e}"),
     }
+}
+
+/// WebView2's own saved-passwords database.
+fn login_data_path(paths: &Paths) -> PathBuf {
+    paths.webview_data().join("EBWebView/Default/Login Data")
+}
+
+/// The AES key WebView2 encrypts our saved passwords with; `None` before WebView2's first run.
+fn webview_password_key(paths: &Paths) -> Option<import::crypto::Key> {
+    let local_state = paths.webview_data().join("EBWebView/Local State");
+    import::crypto::key_from_local_state(&local_state, &platform::dpapi_unprotect)
 }
 
 // Icons.folder and Icons.globe in app.slint, for native menus.
@@ -469,6 +484,9 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_refresh_import(|| ui_post(UiEvent::RefreshImport));
     ui.on_import_run(|bookmarks, history| ui_post(UiEvent::ImportRun { bookmarks, history }));
     ui.on_import_passwords_csv(|| ui_post(UiEvent::ImportPasswordsCsv));
+    ui.on_password_search(|q| ui_post(UiEvent::PasswordSearch(q.into())));
+    ui.on_toggle_password(|id| ui_post(UiEvent::TogglePassword(id.max(0) as usize)));
+    ui.on_copy_password(|id| ui_post(UiEvent::CopyPassword(id.max(0) as usize)));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -616,6 +634,7 @@ struct Models {
     top_sites: Rc<VecModel<LinkData>>,
     extensions: Rc<VecModel<ExtensionData>>,
     import_profiles: Rc<VecModel<ImportProfileData>>,
+    passwords: Rc<VecModel<PasswordData>>,
 }
 
 struct App {
@@ -662,6 +681,10 @@ struct App {
     system_memory_free: u64,
     /// Detected browser profiles for the import page, in UI order.
     import_profiles: Vec<Profile>,
+    /// The passwords page's logins and the key to decrypt them, held only while the page shows.
+    saved_logins: Vec<import::login_db::SavedLogin>,
+    password_key: Option<import::crypto::Key>,
+    password_query: String,
     /// The docked DevTools WebView, once attached.
     devtools_view: Option<WebView>,
     devtools_creating: bool,
@@ -703,6 +726,7 @@ impl App {
             top_sites: Rc::new(VecModel::default()),
             extensions: Rc::new(VecModel::default()),
             import_profiles: Rc::new(VecModel::default()),
+            passwords: Rc::new(VecModel::default()),
         };
         ui.set_tabs(ModelRc::from(models.tabs.clone()));
         ui.set_suggestions(ModelRc::from(models.suggestions.clone()));
@@ -712,6 +736,7 @@ impl App {
         ui.set_top_sites(ModelRc::from(models.top_sites.clone()));
         ui.set_extensions(ModelRc::from(models.extensions.clone()));
         ui.set_import_profiles(ModelRc::from(models.import_profiles.clone()));
+        ui.set_password_items(ModelRc::from(models.passwords.clone()));
         ui.set_data_dir(paths.root.display().to_string().into());
         ui.set_app_version(env!("CARGO_PKG_VERSION").into());
         ui.set_search_hint(url_input::search_hint(&cfg.search_url).into());
@@ -759,6 +784,9 @@ impl App {
             window_state: None,
             system_memory_free: 0,
             import_profiles: Vec::new(),
+            saved_logins: Vec::new(),
+            password_key: None,
+            password_query: String::new(),
             devtools_view: None,
             devtools_creating: false,
             pending_devtools_url: None,
@@ -968,6 +996,7 @@ impl App {
                 | UiEvent::OpenUrlNewTab(_)
                 | UiEvent::AddressEdited(_)
                 | UiEvent::HistorySearch(_)
+                | UiEvent::PasswordSearch(_)
                 | UiEvent::RemoveHistory(_)
                 | UiEvent::SaveBookmark { .. }
                 | UiEvent::OpenUrlFromOtherInstance(_)
@@ -1109,6 +1138,12 @@ impl App {
             UiEvent::RefreshImport => self.refresh_import(),
             UiEvent::ImportRun { bookmarks, history } => self.run_import(bookmarks, history),
             UiEvent::ImportPasswordsCsv => self.import_passwords_csv(),
+            UiEvent::PasswordSearch(q) => {
+                self.password_query = q;
+                self.refresh_passwords();
+            }
+            UiEvent::TogglePassword(id) => self.toggle_password(id),
+            UiEvent::CopyPassword(id) => self.copy_password(id),
             UiEvent::OpenUrlFromOtherInstance(url) => {
                 // A link clicked in another app: the window comes up front, like Chrome's.
                 if let Some(hwnd) = self.hwnd {
@@ -1209,6 +1244,7 @@ impl App {
             }
             Page::History => self.refresh_history(),
             Page::Extensions => self.request_extension_list(),
+            Page::Passwords => self.load_passwords(),
             _ => {}
         }
     }
@@ -1315,6 +1351,9 @@ impl App {
         }
         // An internal page loads its data as it comes on screen, when its fields start out empty.
         if page != self.ui.get_page() {
+            if self.ui.get_page() == Page::Passwords {
+                self.forget_passwords();
+            }
             self.ui.set_page(page);
             match page {
                 Page::Bookmarks => self.refresh_bookmarks(),
@@ -1335,6 +1374,7 @@ impl App {
                         self.refresh_import();
                     }
                 }
+                Page::Passwords => self.load_passwords(),
                 Page::NewTab | Page::Web => {}
             }
         }
@@ -2932,6 +2972,97 @@ impl App {
     }
 
     // -----------------------------------------------------------------------------------------
+    // Passwords page
+
+    /// Reads WebView2's saved logins from a copy of `Login Data` (WebView2 keeps the file locked
+    /// while it runs, but copying it works). Passwords stay encrypted until one is revealed.
+    fn load_passwords(&mut self) {
+        self.password_query.clear();
+        self.ui.set_passwords_message(SharedString::new());
+        let login_data = login_data_path(&self.paths);
+        self.saved_logins = if login_data.is_file() {
+            let scratch = self.paths.root.join("passwords-tmp");
+            let read = import::copy_db(&login_data, &scratch, "Login Data").and_then(|db| import::login_db::read(&db));
+            // The copy holds every saved password, encrypted; don't leave it lying around.
+            let _ = std::fs::remove_dir_all(&scratch);
+            match read {
+                Ok(logins) => logins,
+                Err(e) => {
+                    log!("cannot read saved passwords: {e}");
+                    self.ui.set_passwords_message("無法讀取密碼資料庫，請稍後再試。".into());
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+        self.password_key = if self.saved_logins.is_empty() { None } else { webview_password_key(&self.paths) };
+        debug!("passwords page: {} saved logins, key {}", self.saved_logins.len(), self.password_key.is_some());
+        self.refresh_passwords();
+    }
+
+    fn refresh_passwords(&mut self) {
+        let query = self.password_query.trim().to_lowercase();
+        let rows: Vec<PasswordData> = self
+            .saved_logins
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| {
+                query.is_empty()
+                    || import::login_db::site_of(&l.realm).to_lowercase().contains(&query)
+                    || l.username.to_lowercase().contains(&query)
+            })
+            .map(|(i, l)| PasswordData {
+                id: i as i32,
+                site: import::login_db::site_of(&l.realm).into(),
+                username: l.username.as_str().into(),
+                password: SharedString::new(),
+                revealed: false,
+                favicon: self.favicons.get(&l.realm).unwrap_or_default(),
+            })
+            .collect();
+        self.models.passwords.set_vec(rows);
+    }
+
+    /// Drops every saved login and the key once the passwords page is no longer showing.
+    fn forget_passwords(&mut self) {
+        self.saved_logins = Vec::new();
+        self.password_key = None;
+        self.models.passwords.set_vec(Vec::new());
+    }
+
+    fn decrypt_password(&self, id: usize) -> Option<String> {
+        let login = self.saved_logins.get(id)?;
+        let plain = import::crypto::decrypt_v10(self.password_key.as_ref()?, &login.password_value)?;
+        String::from_utf8(plain).ok()
+    }
+
+    fn toggle_password(&mut self, id: usize) {
+        let model = &self.models.passwords;
+        let Some((row, mut data)) =
+            (0..model.row_count()).filter_map(|r| model.row_data(r).map(|d| (r, d))).find(|(_, d)| d.id as usize == id)
+        else {
+            return;
+        };
+        if data.revealed {
+            data.password = SharedString::new();
+        } else {
+            data.password = self.decrypt_password(id).unwrap_or_else(|| "（無法解密）".into()).into();
+        }
+        data.revealed = !data.revealed;
+        self.models.passwords.set_row_data(row, data);
+    }
+
+    fn copy_password(&mut self, id: usize) {
+        let Some(hwnd) = self.hwnd else { return };
+        match self.decrypt_password(id) {
+            Some(password) if platform::copy_secret_to_clipboard(hwnd, &password) => self.set_status("已複製密碼"),
+            Some(_) => self.set_status("無法存取剪貼簿，請再試一次"),
+            None => self.set_status("無法解密這個密碼"),
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
     // MCP tool calls (run on the UI thread; see `mcp_dispatch`)
 
     /// Resolves an optional tab id to an index, defaulting to the active tab.
@@ -3214,6 +3345,7 @@ impl App {
             MenuItem::entry(8, "全螢幕\tF11"),
             MenuItem::entry(9, "開發人員工具\tF12"),
             MenuItem::Separator,
+            MenuItem::entry(14, "密碼"),
             MenuItem::entry(10, "擴充功能"),
             MenuItem::entry(11, "從其他瀏覽器匯入…"),
             MenuItem::entry(12, "設定"),
@@ -3239,6 +3371,7 @@ impl App {
             11 => self.show_page(Page::Import),
             12 => self.show_page(Page::Settings),
             13 => self.quit("結束 in the menu"),
+            14 => self.show_page(Page::Passwords),
             _ => {}
         }
     }

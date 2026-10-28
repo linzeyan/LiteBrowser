@@ -1,11 +1,13 @@
-//! Writes imported logins into LiteBrowser's own WebView2 "Login Data" SQLite file.
+//! LiteBrowser's own WebView2 "Login Data" SQLite file: imported logins go in, and the passwords
+//! page reads the saved ones back out.
 //!
-//! There is no WebView2 API to add a saved password, so the only way to make imported passwords
-//! autofill is to insert them into WebView2's own `logins` table, with `password_value` encrypted
-//! using WebView2's own key (see `crypto`). This runs at startup, before the WebView2 environment
-//! is created, because WebView2 keeps the file locked while it runs.
+//! There is no WebView2 API to add or list saved passwords, so the only way to make imported
+//! passwords autofill is to insert them into WebView2's own `logins` table, with `password_value`
+//! encrypted using WebView2's own key (see `crypto`). Writing runs at startup, before the WebView2
+//! environment is created, because WebView2 keeps the file locked while it runs; reading works on a
+//! copy taken while it runs.
 //!
-//! It never touches another browser's store; the logins come from a user-exported CSV.
+//! It never touches another browser's store; imported logins come from a user-exported CSV.
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -51,6 +53,47 @@ pub fn apply(login_data: &Path, key: &Key, logins: &[ImportedLogin]) -> Result<A
         applied.added += 1;
     }
     Ok(applied)
+}
+
+/// One login WebView2 saved, its password still encrypted: it is decrypted only when the user asks
+/// to see or copy it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SavedLogin {
+    /// Chromium's grouping key, e.g. "https://github.com/".
+    pub realm: String,
+    pub username: String,
+    pub password_value: Vec<u8>,
+}
+
+/// Reads the saved logins from a `Login Data` file, sorted by site then username. Sites the user
+/// told WebView2 never to save for (`blacklisted_by_user`) carry no password and are left out.
+pub fn read(login_data: &Path) -> Result<Vec<SavedLogin>, String> {
+    let conn = super::open_db(login_data)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT signon_realm, username_value, password_value FROM logins
+             WHERE blacklisted_by_user = 0",
+        )
+        .map_err(|e| format!("讀取密碼失敗：{e}"))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SavedLogin {
+                realm: row.get(0)?,
+                username: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                password_value: row.get::<_, Option<Vec<u8>>>(2)?.unwrap_or_default(),
+            })
+        })
+        .map_err(|e| format!("讀取密碼失敗：{e}"))?;
+    let mut logins: Vec<SavedLogin> = rows.filter_map(Result::ok).collect();
+    logins.sort_by(|a, b| (site_of(&a.realm), &a.username).cmp(&(site_of(&b.realm), &b.username)));
+    Ok(logins)
+}
+
+/// "github.com" from "https://github.com/": what the passwords page shows and sorts by.
+pub fn site_of(realm: &str) -> &str {
+    let rest = realm.split_once("://").map_or(realm, |(_, rest)| rest);
+    let host = rest.trim_end_matches('/');
+    host.strip_prefix("www.").unwrap_or(host)
 }
 
 fn table_columns(conn: &rusqlite::Connection, table: &str) -> Result<BTreeSet<String>, String> {
@@ -218,6 +261,36 @@ mod tests {
             .query_row("SELECT signon_realm FROM logins WHERE username_value='alice'", [], |r| r.get(0))
             .unwrap();
         assert_eq!(realm, "https://github.com/");
+    }
+
+    #[test]
+    fn reads_saved_logins_for_the_passwords_page() {
+        let dir = super::super::test_dir("logindb-read");
+        let path = dir.join("Login Data");
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        create_test_logins_table(&conn);
+        // A "never save for this site" entry: no password, must not be listed as a saved login.
+        conn.execute(
+            "INSERT INTO logins (origin_url, signon_realm, date_created, blacklisted_by_user, scheme)
+             VALUES ('https://never.com/', 'https://never.com/', 0, 1, 0)",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        let key: Key = [5u8; 32];
+        let logins = vec![
+            login("https://www.zeta.com/login", "zed", "z-pw"),
+            login("https://github.com/login", "bob", "b-pw"),
+            login("https://github.com/login", "alice", "a-pw"),
+        ];
+        apply(&path, &key, &logins).unwrap();
+
+        let saved = read(&path).unwrap();
+        let listed: Vec<(&str, &str)> = saved.iter().map(|l| (site_of(&l.realm), l.username.as_str())).collect();
+        // Sorted by site as shown (without "www."), then username; the never-save site is absent.
+        assert_eq!(listed, vec![("github.com", "alice"), ("github.com", "bob"), ("zeta.com", "zed")]);
+        assert_eq!(crypto::decrypt_v10(&key, &saved[0].password_value).as_deref(), Some(b"a-pw".as_slice()));
     }
 
     #[test]

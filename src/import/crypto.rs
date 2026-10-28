@@ -1,11 +1,12 @@
-//! Writing imported passwords into LiteBrowser's *own* WebView2 password store.
+//! LiteBrowser's *own* WebView2 password store: encrypting imported passwords into it, and
+//! decrypting its entries for the passwords page.
 //!
 //! WebView2 stores each saved password in its "Login Data" SQLite file, with the value encoded
 //! in Chromium's `os_crypt` format: `v10` + 12-byte nonce + AES-256-GCM ciphertext. The AES key
 //! lives DPAPI-protected in WebView2's own `Local State`.
 //!
-//! This module only ever reads LiteBrowser's own WebView2 key and encrypts into LiteBrowser's own
-//! store. It does not read any other browser's credentials — imported passwords come from a CSV
+//! This module only ever reads LiteBrowser's own WebView2 key, and only ever encrypts into or
+//! decrypts from LiteBrowser's own store. It does not read any other browser's credentials — imported passwords come from a CSV
 //! the user exported themselves (see `csv.rs`).
 
 use aes_gcm::aead::{Aead, KeyInit};
@@ -38,8 +39,7 @@ pub fn encrypt_v10(key: &Key, plaintext: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// Round-trips a value through the same AES-GCM key (used by tests).
-#[cfg(test)]
+/// Decodes a WebView2 password value; `None` when it is not `v10`/`v11` or the key does not fit.
 pub fn decrypt_v10(key: &Key, value: &[u8]) -> Option<Vec<u8>> {
     let rest = value.strip_prefix(b"v10").or_else(|| value.strip_prefix(b"v11"))?;
     if rest.len() < 12 + 16 {
