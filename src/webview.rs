@@ -431,7 +431,7 @@ impl WebView {
                     // A sized/positioned window is a popup (e.g. a login dialog) that needs window.opener,
                     // so it always gets a live WebView. Ctrl/middle clicks become lazy background tabs.
                     let popup = has_size.as_bool() || has_pos.as_bool();
-                    let background = !popup && (modifiers().ctrl || crate::win::page_middle_click());
+                    let background = !popup && (modifiers().ctrl || crate::win::page_background_click());
                     post_engine(
                         tab,
                         EngineEvent::NewWindow(NewWindowRequest {

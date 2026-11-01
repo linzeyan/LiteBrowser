@@ -8,7 +8,7 @@ use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetFocus, GetKeyState, GetKeyboardState, SetFocus, SetKeyboardState, VK_CAPITAL, VK_CONTROL, VK_MENU,
+    GetAsyncKeyState, GetFocus, GetKeyState, GetKeyboardState, SetFocus, SetKeyboardState, VK_CAPITAL, VK_CONTROL, VK_MENU,
 };
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass, ShellExecuteW};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -27,8 +27,9 @@ thread_local! {
     static ACTIVE_CONTROLLER: RefCell<Option<ICoreWebView2Controller>> = const { RefCell::new(None) };
     /// The web page window that had keyboard focus when ours was deactivated.
     static PAGE_FOCUS: Cell<HWND> = const { Cell::new(HWND(std::ptr::null_mut())) };
-    /// The mouse button last pressed in a web page, and when.
-    static PAGE_PRESS: Cell<Option<(u32, Instant)>> = const { Cell::new(None) };
+    /// Whether the last mouse press in a web page asks for a background tab (middle, or left with
+    /// Ctrl), and when it happened.
+    static PAGE_PRESS: Cell<Option<(bool, Instant)>> = const { Cell::new(None) };
 }
 
 pub fn set_active_controller(controller: Option<ICoreWebView2Controller>) {
@@ -159,7 +160,11 @@ unsafe extern "system" fn subclass_proc(
         WM_PARENTNOTIFY => {
             let event = (wparam.0 & 0xFFFF) as u32;
             if matches!(event, WM_LBUTTONDOWN | WM_MBUTTONDOWN | WM_RBUTTONDOWN | WM_XBUTTONDOWN) {
-                PAGE_PRESS.set(Some((event, Instant::now())));
+                // The physical key, read now: Ctrl goes to the page's window in WebView2's process,
+                // so this thread's own key state need not have seen it.
+                let ctrl = unsafe { GetAsyncKeyState(VK_CONTROL.0 as i32) } < 0;
+                let background = event == WM_MBUTTONDOWN || (event == WM_LBUTTONDOWN && ctrl);
+                PAGE_PRESS.set(Some((background, Instant::now())));
             }
         }
         // Activation gives focus to the top-level window, so coming back from another app left
@@ -248,13 +253,13 @@ pub fn bring_to_front(hwnd: HWND) -> bool {
     }
 }
 
-/// Whether a window the page asks for now comes from a middle click: the last press in a page was
-/// the middle button, moments ago. Asking whether the button is down does not work, because
-/// Chromium opens a middle-clicked link once the button comes back up; pages that open the window
-/// themselves on the press were the only ones that got a background tab. The time limit keeps a
-/// middle press on nothing from turning a later Enter on a link into one.
-pub fn page_middle_click() -> bool {
-    PAGE_PRESS.get().is_some_and(|(button, at)| button == WM_MBUTTONDOWN && at.elapsed() < Duration::from_secs(2))
+/// Whether a window the page asks for now comes from a middle or Ctrl click: the last press in a
+/// page was one, moments ago. Asking whether the button or Ctrl is down does not work, because
+/// Chromium opens the link once the button comes back up, and the request reaches us later still;
+/// pages that open the window themselves on the press were the only ones that got a background
+/// tab. The time limit keeps such a press on nothing from turning a later Enter on a link into one.
+pub fn page_background_click() -> bool {
+    PAGE_PRESS.get().is_some_and(|(background, at)| background && at.elapsed() < Duration::from_secs(2))
 }
 
 /// Moves keyboard focus from the web page back to the Slint window.
