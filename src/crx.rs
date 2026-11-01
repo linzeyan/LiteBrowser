@@ -98,7 +98,8 @@ pub fn unpack(zip_bytes: &[u8], dest: &Path) -> Result<usize, String> {
     let mut written = 0;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| format!("無法展開檔案：{e}"))?;
-        let Some(relative) = safe_entry_path(entry.name()) else { continue };
+        let name = entry.name().map_err(|e| format!("無法展開檔案：{e}"))?;
+        let Some(relative) = safe_entry_path(&name) else { continue };
         let target = dest.join(&relative);
         if let Some(parent) = target.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("無法建立資料夾：{e}"))?;
