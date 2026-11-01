@@ -17,7 +17,7 @@ aes-gcm = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 # A Chrome Web Store .crx is a small header followed by a plain zip.
-zip = { version = "8.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 
 [target.'cfg(windows)'.dependencies]
 slint = { version = "1.18", default-features = false, features = [
