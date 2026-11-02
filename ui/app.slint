@@ -613,6 +613,8 @@ component LinkRow inherits Rectangle {
     callback middle-clicked;
     callback remove;
     callback edit;
+    // Ctrl as of the left press: TouchArea emits `clicked` before the release's pointer event.
+    property <bool> ctrl-press;
 
     height: 48px;
     background: touch.has-hover ? Theme.row-hover : transparent;
@@ -620,10 +622,16 @@ component LinkRow inherits Rectangle {
     touch := TouchArea {
         mouse-cursor: pointer;
         clicked => {
-            root.clicked();
+            if (root.ctrl-press) {
+                root.middle-clicked();
+            } else {
+                root.clicked();
+            }
         }
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.ctrl-press = e.modifiers.control;
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
                 root.middle-clicked();
             }
         }
@@ -806,6 +814,8 @@ component BarChip inherits Rectangle {
     callback clicked;
     callback middle-clicked;
     callback right-clicked;
+    // Ctrl as of the left press: TouchArea emits `clicked` before the release's pointer event.
+    property <bool> ctrl-press;
 
     border-radius: 14px;
     background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
@@ -813,10 +823,17 @@ component BarChip inherits Rectangle {
 
     touch := TouchArea {
         clicked => {
-            root.clicked();
+            // A folder still opens its menu; there is no tab to open it in.
+            if (root.ctrl-press && !root.folder) {
+                root.middle-clicked();
+            } else {
+                root.clicked();
+            }
         }
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
+                root.ctrl-press = e.modifiers.control;
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
                 root.middle-clicked();
             } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
                 root.right-clicked();

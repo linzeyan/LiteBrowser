@@ -13,6 +13,7 @@ use windows::Win32::Security::Cryptography::{CryptUnprotectData, CRYPT_INTEGER_B
 use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
 use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetMenuItemCount,
@@ -315,6 +316,12 @@ pub fn popup_menu_below(items: &[MenuItem], x: i32, y: i32, right_aligned: bool)
     let _ = unsafe { ClientToScreen(owner, &mut pt) };
     let align = if right_aligned { TPM_RIGHTALIGN } else { TPM_LEFTALIGN };
     track_menu(items, pt, TPM_RETURNCMD | TPM_RIGHTBUTTON | align | TPM_TOPALIGN)
+}
+
+/// Whether Ctrl is held, as of the last input this thread took: right after a menu returns, the
+/// click that picked the item.
+pub fn ctrl_down() -> bool {
+    unsafe { GetKeyState(VK_CONTROL.0 as i32) < 0 }
 }
 
 fn track_menu(items: &[MenuItem], pt: POINT, flags: TRACK_POPUP_MENU_FLAGS) -> u32 {

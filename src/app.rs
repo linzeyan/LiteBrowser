@@ -2800,7 +2800,11 @@ impl App {
         let chosen = platform::popup_menu_below(&menu, (x * scale).round() as i32, (y * scale).round() as i32, right_aligned);
         if let Some(b) = (chosen as usize).checked_sub(1).and_then(|i| self.bookmarks.items().get(i)) {
             let url = b.url.clone();
-            self.open_url(url);
+            if platform::ctrl_down() {
+                self.handle_ui(UiEvent::OpenUrlNewTab(url));
+            } else {
+                self.open_url(url);
+            }
         }
     }
 
