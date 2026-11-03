@@ -548,14 +548,16 @@ impl WebView {
 
             // Favicons: ICoreWebView2_15 (newer runtimes). Ignored on older ones.
             if let Ok(wv15) = core.cast::<ICoreWebView2_15>() {
-                let wv15_for_fetch = wv15.clone();
                 wv15.add_FaviconChanged(
-                    &FaviconChangedEventHandler::create(Box::new(move |_, _| {
+                    &FaviconChangedEventHandler::create(Box::new(move |sender, _| {
+                        // The view comes from `sender`: the view holds this handler, so capturing
+                        // the view would be a reference cycle it can never be freed from.
+                        let Some(wv15) = sender.and_then(|s| s.cast::<ICoreWebView2_15>().ok()) else { return Ok(()) };
                         // A page without an icon has an empty FaviconUri; GetFavicon would still
                         // hand back WebView2's generic globe, which would then be cached as the
                         // site's icon and shadow one imported from another browser.
                         let mut uri = PWSTR::null();
-                        wv15_for_fetch.FaviconUri(&mut uri)?;
+                        wv15.FaviconUri(&mut uri)?;
                         if take_pwstr(uri).is_empty() {
                             post_engine(tab, EngineEvent::Favicon(Vec::new()));
                             return Ok(());
@@ -571,7 +573,7 @@ impl WebView {
                             }
                             Ok(())
                         }));
-                        let _ = wv15_for_fetch.GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &handler);
+                        let _ = wv15.GetFavicon(COREWEBVIEW2_FAVICON_IMAGE_FORMAT_PNG, &handler);
                         Ok(())
                     })),
                     &mut token,
