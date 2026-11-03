@@ -260,7 +260,6 @@ pub fn run() {
         }
     }
 
-    platform::set_app_id();
     unsafe {
         let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
     }

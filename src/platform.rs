@@ -14,7 +14,6 @@ use windows::Win32::System::DataExchange::COPYDATASTRUCT;
 use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL};
-use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
 use windows::Win32::UI::WindowsAndMessaging::{
     AllowSetForegroundWindow, AppendMenuW, CreatePopupMenu, DestroyMenu, FindWindowW, GetCursorPos, GetMenuItemCount,
     GetWindowThreadProcessId, SendMessageW, SetForegroundWindow, SetMenuItemInfoW, TrackPopupMenuEx, HMENU, MENUITEMINFOW, MF_CHECKED, MF_DISABLED, MF_GRAYED,
@@ -55,14 +54,6 @@ pub fn system_memory() -> SystemMemory {
         } else {
             SystemMemory::default()
         }
-    }
-}
-
-/// Sets an explicit AppUserModelID so Windows groups our windows under one taskbar button
-/// and uses our icon (rather than lumping us in with the WebView2 host).
-pub fn set_app_id() {
-    unsafe {
-        let _ = SetCurrentProcessExplicitAppUserModelID(&HSTRING::from("LiteBrowser.Browser"));
     }
 }
 
