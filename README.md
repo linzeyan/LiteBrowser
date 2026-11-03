@@ -92,7 +92,7 @@
 - 已儲存的密碼：⋮ 選單 →「密碼」（或設定 → 資料 →「密碼」）列出網站與帳號，可搜尋；按眼睛圖示顯示密碼、
   按複製圖示複製（不會進 Windows 的剪貼簿歷程 Win+V）。目前只能查看，不能在這裡刪除或修改
 - 廣告／追蹤網域封鎖：內建一份小清單，可在 `blocklist.txt` 自行增加（設定 →「編輯清單」用記事本開啟）
-- 擴充功能：可直接貼 Chrome 線上應用程式商店網址安裝，也支援手動放解壓縮後的資料夾（見下方）
+- 擴充功能：可直接貼 Chrome 線上應用程式商店或 Edge 附加元件網站的網址安裝，也支援手動放解壓縮後的資料夾（見下方）
 - 無痕分頁：Ctrl+Shift+N、⋮ 選單或分頁右鍵選單。分頁顯示面具圖示；切到無痕分頁時整個介面
   變成深色（同 Chrome 的無痕視窗），一眼就分得出來。關掉後不留 Cookie、
   歷史紀錄、快取或網站圖示，也不會被記進下次要恢復的分頁
@@ -146,13 +146,14 @@ HTML、執行 JavaScript（可用來點按鈕、填表單）、截圖（只能�
 
 ## 擴充功能
 
-### 從 Chrome 線上應用程式商店安裝
+### 從 Chrome 線上應用程式商店或 Edge 附加元件網站安裝
 
 1. 工具列的拼圖按鈕 → 開啟擴充功能頁
 2. 把商店頁面的網址貼進輸入框，按「安裝」
 
    例：`https://chromewebstore.google.com/detail/read-frog-translate-learn/modkelfkcfjpgbfmnbnllalkiogfofhb`
-   （貼擴充功能 ID 本身也可以。）
+   或 `https://microsoftedge.microsoft.com/addons/detail/ublock-origin/odfafepnkmbhccpbejgmiehpchacaeak`
+   （貼擴充功能 ID 本身也可以，會先找 Chrome 商店、再找 Edge。）
 3. 下載完會自動安裝，重新整理網頁後生效
 
 LiteBrowser 會向商店要 `.crx`，解開成一個資料夾放在 `extensions\<擴充功能 ID>`，再交給 WebView2 載入。
@@ -242,7 +243,7 @@ cargo build --release          # 只能在 Windows 上產生可執行檔
 | `ui/app.slint` | 整個介面 |
 | `src/app.rs` | 分頁、事件處理、把狀態推到介面 |
 | `src/webview.rs` | WebView2 封裝（建立、事件、凍結、擴充功能、封鎖） |
-| `src/crx.rs` | 從 Chrome 線上應用程式商店下載並解開 `.crx` |
+| `src/crx.rs` | 從 Chrome 線上應用程式商店或 Edge 附加元件網站下載並解開 `.crx` |
 | `src/tabs.rs` | 凍結／釋放策略（純邏輯，有測試） |
 | `src/memory.rs` | 計算整個瀏覽器程序樹的記憶體 |
 | `src/win.rs` | Slint 視窗與 WebView2 子視窗之間的 Win32 處理 |

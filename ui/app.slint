@@ -2435,7 +2435,7 @@ export component AppWindow inherits Window {
                                     padding: 20px;
                                     spacing: 12px;
                                     Text {
-                                        text: "貼上 Chrome 線上應用程式商店的網址（或擴充功能 ID），按「安裝」即可下載安裝。";
+                                        text: "貼上 Chrome 線上應用程式商店或 Edge 附加元件網站的網址（或擴充功能 ID），按「安裝」即可下載安裝。";
                                         wrap: word-wrap;
                                         color: Theme.text;
                                     }
@@ -2443,7 +2443,7 @@ export component AppWindow inherits Window {
                                     HorizontalLayout {
                                         spacing: 8px;
                                         store-url := LineEdit {
-                                            placeholder-text: "https://chromewebstore.google.com/detail/.../abcdefgh...";
+                                            placeholder-text: "https://chromewebstore.google.com/detail/… 或 https://microsoftedge.microsoft.com/addons/detail/…";
                                             horizontal-stretch: 1;
                                             enabled: !root.extension-installing;
                                             accepted => {

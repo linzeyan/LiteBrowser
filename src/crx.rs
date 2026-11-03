@@ -1,4 +1,4 @@
-//! Installing an extension from the Chrome Web Store.
+//! Installing an extension from the Chrome Web Store or the Microsoft Edge Add-ons site.
 //!
 //! WebView2 can only load an *unpacked* extension folder, so a store install is three steps:
 //! work out the extension id from the URL the user pasted, download the `.crx` the store serves,
@@ -8,32 +8,75 @@
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-/// A Chrome Web Store extension id: 32 letters a–p.
+/// An extension id, Chrome's or Edge's alike: 32 letters a–p.
 fn is_extension_id(text: &str) -> bool {
     text.len() == 32 && text.bytes().all(|b| b.is_ascii_lowercase() && b <= b'p')
 }
 
-/// Pulls the extension id out of whatever the user pasted: a full store URL, a `/detail/...`
-/// path, or the bare id.
-pub fn parse_store_url(input: &str) -> Option<String> {
-    let text = input.trim();
-    if is_extension_id(text) {
-        return Some(text.to_string());
-    }
-    // Both the old (chrome.google.com/webstore/detail/slug/id) and new
-    // (chromewebstore.google.com/detail/slug/id) shapes end with the id, possibly followed by
-    // a query or fragment; some locales insert a language segment before `detail`.
-    let body = text.split(['?', '#']).next()?;
-    body.split('/').rev().map(|part| part.trim()).find(|part| is_extension_id(part)).map(str::to_string)
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Store {
+    Chrome,
+    Edge,
 }
 
-/// The store's own download endpoint — the one Chrome itself asks for an update.
-/// `prodversion` has to look like a real Chrome version or the store answers 204.
-pub fn download_url(id: &str) -> String {
-    format!(
-        "https://clients2.google.com/service/update2/crx\
-         ?response=redirect&acceptformat=crx2,crx3&prodversion=140.0.0.0&x=id%3D{id}%26uc"
-    )
+impl Store {
+    pub fn name(self) -> &'static str {
+        match self {
+            Store::Chrome => "Chrome 線上應用程式商店",
+            Store::Edge => "Edge 附加元件網站",
+        }
+    }
+}
+
+/// Pulls the extension id out of whatever the user pasted — a full store URL, a `/detail/...`
+/// path, or the bare id — with the stores to ask for it, in order. The two stores' ids look
+/// alike, so a bare id is tried at both.
+pub fn parse_store_url(input: &str) -> Option<(String, &'static [Store])> {
+    let text = input.trim();
+    if is_extension_id(text) {
+        return Some((text.to_string(), &[Store::Chrome, Store::Edge]));
+    }
+    // Chrome's old (chrome.google.com/webstore/detail/slug/id) and new
+    // (chromewebstore.google.com/detail/slug/id) shapes and Edge's
+    // (microsoftedge.microsoft.com/addons/detail/slug/id) all end with the id, possibly followed
+    // by a query or fragment; some locales insert a language segment before `detail`.
+    let body = text.split(['?', '#']).next()?;
+    let id = body.split('/').rev().map(|part| part.trim()).find(|part| is_extension_id(part))?;
+    let host = crate::url_input::host_of(body).unwrap_or_default();
+    let stores: &'static [Store] = match host.as_str() {
+        "microsoftedge.microsoft.com" => &[Store::Edge],
+        "chromewebstore.google.com" | "chrome.google.com" => &[Store::Chrome],
+        _ => &[Store::Chrome, Store::Edge],
+    };
+    Some((id.to_string(), stores))
+}
+
+/// The store's own download endpoint — the one the browser itself asks for an update.
+/// Chrome's `prodversion` has to look like a real Chrome version or the store answers 204.
+pub fn download_url(store: Store, id: &str) -> String {
+    match store {
+        Store::Chrome => format!(
+            "https://clients2.google.com/service/update2/crx\
+             ?response=redirect&acceptformat=crx2,crx3&prodversion=140.0.0.0&x=id%3D{id}%26uc"
+        ),
+        Store::Edge => format!(
+            "https://edge.microsoft.com/extensionwebstorebase/v1/crx\
+             ?response=redirect&prod=chromiumcrx&prodchannel=&x=id%3D{id}%26installsource%3Dondemand%26uc"
+        ),
+    }
+}
+
+/// Where to fetch an Edge store `.crx` from, given where the store redirects. The store sends it
+/// to its CDN over plain http (Edge checks the package's signature; we don't), while the CDN's
+/// `sf` host serves the same file over https (same sha256, 2026-11-03). Any other plain-http
+/// target is refused rather than downloading code anyone on the way could swap.
+pub fn secure_edge_location(location: &str) -> Option<String> {
+    if location.starts_with("https://") {
+        return Some(location.to_string());
+    }
+    let (host, path) = location.strip_prefix("http://")?.split_once('/')?;
+    let cdn = host.starts_with("msedgeextensions.") && host.ends_with(".tlu.dl.delivery.mp.microsoft.com");
+    cdn.then(|| format!("https://msedgeextensions.sf.tlu.dl.delivery.mp.microsoft.com/{path}"))
 }
 
 /// Strips the CRX wrapper, returning the zip inside.
@@ -147,16 +190,37 @@ pub fn manifest_name(dir: &Path) -> Option<String> {
     None
 }
 
-/// Downloads an extension and unpacks it under `extensions_dir`, returning its folder name.
-/// Windows-only: it needs WinHTTP.
+/// Downloads an extension from the first of `stores` that has it and unpacks it under
+/// `extensions_dir`, returning its folder name. Windows-only: it needs WinHTTP.
 #[cfg(windows)]
-pub fn install(id: &str, extensions_dir: &Path) -> Result<String, String> {
+pub fn install(id: &str, stores: &[Store], extensions_dir: &Path) -> Result<String, String> {
+    let mut errors = Vec::new();
+    for &store in stores {
+        match download(store, id) {
+            Ok(bytes) => {
+                let zip_bytes = zip_payload(&bytes)?;
+                unpack(zip_bytes, &extensions_dir.join(id))?;
+                return Ok(id.to_string());
+            }
+            Err(e) if stores.len() == 1 => return Err(e),
+            Err(e) => errors.push(format!("{}：{e}", store.name())),
+        }
+    }
+    Err(errors.join("；"))
+}
+
+#[cfg(windows)]
+fn download(store: Store, id: &str) -> Result<Vec<u8>, String> {
+    let url = download_url(store, id);
+    let url = match store {
+        Store::Chrome => url,
+        Store::Edge => {
+            let target = crate::net::redirect_target(&url)?;
+            secure_edge_location(&target).ok_or_else(|| format!("商店把下載轉到不安全的網址：{target}"))?
+        }
+    };
     // 64 MB is generous for an extension and still bounded.
-    let bytes = crate::net::get(&download_url(id), "application/octet-stream", 64 * 1024 * 1024)?;
-    let zip_bytes = zip_payload(&bytes)?;
-    let dest = extensions_dir.join(id);
-    unpack(zip_bytes, &dest)?;
-    Ok(id.to_string())
+    crate::net::get(&url, "application/octet-stream", 64 * 1024 * 1024)
 }
 
 #[cfg(test)]
@@ -164,22 +228,24 @@ mod tests {
     use super::*;
 
     const ID: &str = "modkelfkcfjpgbfmnbnllalkiogfofhb";
+    const EDGE_ID: &str = "odfafepnkmbhccpbejgmiehpchacaeak";
+
+    fn id_of(input: &str) -> Option<String> {
+        parse_store_url(input).map(|(id, _)| id)
+    }
 
     #[test]
     fn reads_ids_out_of_store_urls() {
         assert_eq!(
-            parse_store_url("https://chromewebstore.google.com/detail/read-frog-translate-learn/modkelfkcfjpgbfmnbnllalkiogfofhb")
-                .as_deref(),
+            id_of("https://chromewebstore.google.com/detail/read-frog-translate-learn/modkelfkcfjpgbfmnbnllalkiogfofhb").as_deref(),
             Some(ID)
         );
+        assert_eq!(id_of(&format!("https://chrome.google.com/webstore/detail/read-frog/{ID}?hl=zh-TW")).as_deref(), Some(ID));
+        assert_eq!(id_of(&format!("  {ID}  ")).as_deref(), Some(ID));
+        assert_eq!(id_of(&format!("https://chromewebstore.google.com/zh-TW/detail/slug/{ID}/reviews")).as_deref(), Some(ID));
         assert_eq!(
-            parse_store_url(&format!("https://chrome.google.com/webstore/detail/read-frog/{ID}?hl=zh-TW")).as_deref(),
-            Some(ID)
-        );
-        assert_eq!(parse_store_url(&format!("  {ID}  ")).as_deref(), Some(ID));
-        assert_eq!(
-            parse_store_url(&format!("https://chromewebstore.google.com/zh-TW/detail/slug/{ID}/reviews")).as_deref(),
-            Some(ID)
+            id_of(&format!("https://microsoftedge.microsoft.com/addons/detail/ublock-origin/{EDGE_ID}?hl=zh-TW")).as_deref(),
+            Some(EDGE_ID)
         );
 
         assert_eq!(parse_store_url("https://example.com/"), None);
@@ -189,10 +255,36 @@ mod tests {
     }
 
     #[test]
-    fn download_url_names_the_extension() {
-        let url = download_url(ID);
+    fn each_store_is_asked_for_its_own_extensions() {
+        // An Edge-only extension is not in Chrome's store (404), so its page must go to Edge's.
+        let edge = format!("https://microsoftedge.microsoft.com/addons/detail/ublock-origin/{EDGE_ID}");
+        assert_eq!(parse_store_url(&edge).unwrap().1, [Store::Edge]);
+        assert_eq!(parse_store_url(&format!("https://chromewebstore.google.com/detail/x/{ID}")).unwrap().1, [Store::Chrome]);
+        // A bare id could be from either.
+        assert_eq!(parse_store_url(EDGE_ID).unwrap().1, [Store::Chrome, Store::Edge]);
+    }
+
+    #[test]
+    fn download_urls_name_the_extension() {
+        let url = download_url(Store::Chrome, ID);
         assert!(url.starts_with("https://clients2.google.com/service/update2/crx?"), "{url}");
         assert!(url.contains(ID));
+        let url = download_url(Store::Edge, EDGE_ID);
+        assert!(url.starts_with("https://edge.microsoft.com/extensionwebstorebase/v1/crx?response=redirect&"), "{url}");
+        assert!(url.contains(&format!("id%3D{EDGE_ID}%26")), "{url}");
+    }
+
+    #[test]
+    fn edge_downloads_stay_on_https() {
+        let path = "filestreamingservice/files/28b153aa-2ed6-4d95-aca0-5df1aa9b8237?P1=1794309544&P2=404";
+        assert_eq!(
+            secure_edge_location(&format!("http://msedgeextensions.f.tlu.dl.delivery.mp.microsoft.com/{path}")),
+            Some(format!("https://msedgeextensions.sf.tlu.dl.delivery.mp.microsoft.com/{path}"))
+        );
+        assert_eq!(secure_edge_location("https://example.com/x.crx").as_deref(), Some("https://example.com/x.crx"));
+        // Plain http anywhere else would hand the extension's code to whoever is on the way.
+        assert_eq!(secure_edge_location("http://example.com/x.crx"), None);
+        assert_eq!(secure_edge_location("http://msedgeextensions.f.tlu.dl.delivery.mp.microsoft.com.evil.example/x"), None);
     }
 
     fn crx3(payload: &[u8], header: &[u8]) -> Vec<u8> {

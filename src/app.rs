@@ -85,7 +85,7 @@ pub enum Event {
     ViewCreated { tab: TabId, result: Result<ICoreWebView2Controller, String>, new_window: Option<NewWindowRequest> },
     ExtensionsListed(Result<Vec<ExtensionInfo>, String>),
     ExtensionInstalled { folder: String, result: Result<ExtensionInfo, String> },
-    /// A Chrome Web Store download finished; the payload is the unpacked folder name.
+    /// A store download finished; the payload is the unpacked folder name.
     ExtensionDownloaded(Result<String, String>),
     ExtensionChanged(Result<(), String>),
     /// The docked DevTools controller finished being created.
@@ -2285,14 +2285,15 @@ impl App {
         }
     }
 
-    /// Downloads an extension from the Chrome Web Store and installs what comes out of it.
+    /// Downloads an extension from the Chrome or Edge store and installs what comes out of it.
     fn install_from_store(&mut self, input: &str) {
         if self.extension_installing {
             return;
         }
-        let Some(id) = crx::parse_store_url(input) else {
+        let Some((id, stores)) = crx::parse_store_url(input) else {
             self.ui.set_extensions_message(
-                "看不出擴充功能 ID。請貼上商店頁面的網址，例如 https://chromewebstore.google.com/detail/名稱/擴充功能ID。"
+                "看不出擴充功能 ID。請貼上商店頁面的網址，例如 https://chromewebstore.google.com/detail/名稱/擴充功能ID \
+                 或 https://microsoftedge.microsoft.com/addons/detail/名稱/擴充功能ID。"
                     .into(),
             );
             return;
@@ -2307,7 +2308,7 @@ impl App {
 
         let dir = self.paths.extensions_dir();
         std::thread::spawn(move || {
-            let result = crx::install(&id, &dir);
+            let result = crx::install(&id, stores, &dir);
             // Events carry COM pointers, so one is only ever built on the UI thread.
             let _ = slint::invoke_from_event_loop(move || post(Event::ExtensionDownloaded(result)));
         });

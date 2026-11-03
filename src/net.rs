@@ -1,15 +1,15 @@
 //! A small HTTPS GET built on WinHTTP.
 //!
-//! Used for the update check and for fetching an extension from the Chrome Web Store. WinHTTP is
+//! Used for the update check and for fetching an extension from the Chrome or Edge store. WinHTTP is
 //! part of Windows, so this costs no extra dependency and picks up the machine's proxy settings —
 //! which matters on a locked-down VDI.
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Networking::WinHttp::{
     WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_FLAG_SECURE, WINHTTP_QUERY_FLAG_NUMBER,
-    WINHTTP_QUERY_STATUS_CODE,
+    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest, WinHttpSetOption,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE, WINHTTP_OPTION_DISABLE_FEATURE,
+    WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_LOCATION, WINHTTP_QUERY_STATUS_CODE,
 };
 
 /// Closes a WinHTTP handle when it goes out of scope, including on the error paths.
@@ -54,9 +54,17 @@ fn parse_url(url: &str) -> Result<Url<'_>, String> {
     Ok(Url { host, port, path, secure })
 }
 
-/// Fetches a URL, following redirects (WinHTTP does that by default).
-/// `max_bytes` caps the download so a bad URL cannot fill the disk.
-pub fn get(url: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+/// An answered request. Fields drop in order, so the request closes before its connection.
+struct Response {
+    request: Handle,
+    _connect: Handle,
+    _session: Handle,
+    status: u32,
+}
+
+/// Sends a GET and waits for the status line. WinHTTP follows redirects unless told not to, but
+/// never from https to http.
+fn send(url: &str, accept: &str, follow_redirects: bool) -> Result<Response, String> {
     let parsed = parse_url(url)?;
     unsafe {
         let session = Handle(WinHttpOpen(
@@ -86,6 +94,11 @@ pub fn get(url: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, String>
         if request.0.is_null() {
             return Err("無法建立 HTTP 要求".into());
         }
+        if !follow_redirects {
+            let option = WINHTTP_DISABLE_REDIRECTS.to_ne_bytes();
+            WinHttpSetOption(Some(request.0), WINHTTP_OPTION_DISABLE_FEATURE, Some(&option))
+                .map_err(|e| format!("無法設定 HTTP 要求：{e}"))?;
+        }
 
         // GitHub's API needs a User-Agent and an explicit Accept.
         let headers: Vec<u16> =
@@ -104,10 +117,19 @@ pub fn get(url: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, String>
             std::ptr::null_mut(),
         )
         .map_err(|e| format!("讀取狀態碼失敗：{e}"))?;
-        if !(200..300).contains(&status) {
-            return Err(format!("伺服器回應 HTTP {status}"));
-        }
+        Ok(Response { request, _connect: connect, _session: session, status })
+    }
+}
 
+/// Fetches a URL, following redirects (WinHTTP does that by default).
+/// `max_bytes` caps the download so a bad URL cannot fill the disk.
+pub fn get(url: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let response = send(url, accept, true)?;
+    if !(200..300).contains(&response.status) {
+        return Err(format!("伺服器回應 HTTP {}", response.status));
+    }
+    let request = &response.request;
+    unsafe {
         let mut body = Vec::new();
         loop {
             let mut available: u32 = 0;
@@ -131,6 +153,29 @@ pub fn get(url: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, String>
         }
         Ok(body)
     }
+}
+
+/// Where a URL redirects to, without going there: for a server whose redirect leaves https,
+/// which `get` refuses to follow.
+pub fn redirect_target(url: &str) -> Result<String, String> {
+    let response = send(url, "*/*", false)?;
+    if !(300..400).contains(&response.status) {
+        return Err(format!("伺服器回應 HTTP {}，不是轉址", response.status));
+    }
+    let mut buffer = vec![0u16; 4096];
+    let mut size = (buffer.len() * 2) as u32;
+    unsafe {
+        WinHttpQueryHeaders(
+            response.request.0,
+            WINHTTP_QUERY_LOCATION,
+            PCWSTR::null(),
+            Some(buffer.as_mut_ptr() as *mut _),
+            &mut size,
+            std::ptr::null_mut(),
+        )
+        .map_err(|e| format!("讀取轉址目的地失敗：{e}"))?;
+    }
+    Ok(String::from_utf16_lossy(&buffer[..size as usize / 2]))
 }
 
 #[cfg(test)]
