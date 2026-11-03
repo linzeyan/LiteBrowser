@@ -139,6 +139,12 @@ pub enum UiEvent {
     /// The bookmarks bar's » button: the first chip that did not fit, and the button's
     /// bottom-right corner, logical pixels.
     BookmarkOverflowMenu(usize, f32, f32),
+    /// Right-click on a bookmarks-bar folder: its path.
+    BookmarkFolderContextMenu(String),
+    /// A bookmarks-bar chip was dragged from its place to a gap between chips (0 = first).
+    MoveBarItem(usize, usize),
+    /// The bookmark editor window's buttons (its fields are read from the window).
+    BookmarkEditor(EditorAction),
     HistorySearch(String),
     RemoveHistory(String),
     ClearHistory,
@@ -179,6 +185,13 @@ pub enum UiEvent {
     CopyPassword(usize),
     /// A second launch asked this instance to open a URL.
     OpenUrlFromOtherInstance(String),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum EditorAction {
+    Save,
+    Cancel,
+    Remove,
 }
 
 thread_local! {
@@ -269,6 +282,10 @@ pub fn run() {
 
     platform::create_singleton_window(|url| post(Event::Ui(UiEvent::OpenUrlFromOtherInstance(url))));
 
+    if let Err(e) = win::select_backend() {
+        log!("cannot start the UI backend: {e}");
+        return;
+    }
     let ui = match AppWindow::new() {
         Ok(ui) => ui,
         Err(e) => {
@@ -458,6 +475,8 @@ fn wire_callbacks(ui: &AppWindow) {
     ui.on_bookmark_menu(|i| ui_post(UiEvent::BookmarkMenu(i.max(0) as usize)));
     ui.on_bookmark_folder_menu(|path, x, y| ui_post(UiEvent::BookmarkFolderMenu(path.into(), x, y)));
     ui.on_bookmark_overflow_menu(|first, x, y| ui_post(UiEvent::BookmarkOverflowMenu(first.max(0) as usize, x, y)));
+    ui.on_bookmark_folder_context_menu(|path| ui_post(UiEvent::BookmarkFolderContextMenu(path.into())));
+    ui.on_move_bar_item(|from, to| ui_post(UiEvent::MoveBarItem(from.max(0) as usize, to.max(0) as usize)));
     ui.on_history_search(|q| ui_post(UiEvent::HistorySearch(q.into())));
     ui.on_remove_history(|url| ui_post(UiEvent::RemoveHistory(url.into())));
     ui.on_clear_history(|| ui_post(UiEvent::ClearHistory));
@@ -693,6 +712,10 @@ struct App {
     /// Tabs whose DevTools the user left open. Like Chrome they come back with the tab, but only
     /// the tab in front has a DevTools WebView: one per tab would cost a renderer each.
     devtools_tabs: HashSet<TabId>,
+    /// The bookmark editor window, made on first use and kept, hidden, for the next one.
+    bookmark_editor: Option<BookmarkEditor>,
+    /// The bookmark the editor shows: its index and URL as it opened, in case the list changed.
+    editing_bookmark: Option<(usize, String)>,
     /// A hidden WebView for the extensions page while no tab has one: extensions live in the
     /// WebView2 profile, and only a WebView leads to it.
     extension_host: Option<WebView>,
@@ -791,6 +814,8 @@ impl App {
             pending_devtools_url: None,
             devtools_tab: 0,
             devtools_tabs: HashSet::new(),
+            bookmark_editor: None,
+            editing_bookmark: None,
             extension_host: None,
             extension_host_creating: false,
             launch_url,
@@ -882,6 +907,7 @@ impl App {
         };
         self.hwnd = Some(hwnd);
         win::prepare_main_window(hwnd);
+        win::own_later_windows(hwnd);
         platform::set_menu_owner(hwnd);
         self.create_environment();
     }
@@ -1079,6 +1105,9 @@ impl App {
             UiEvent::BookmarkMenu(i) => self.bookmark_menu(i),
             UiEvent::BookmarkFolderMenu(path, x, y) => self.bookmark_folder_menu(&path, x, y),
             UiEvent::BookmarkOverflowMenu(first, x, y) => self.bookmark_overflow_menu(first, x, y),
+            UiEvent::BookmarkFolderContextMenu(path) => self.bookmark_folder_context_menu(&path),
+            UiEvent::MoveBarItem(from, to) => self.move_bar_item(from, to),
+            UiEvent::BookmarkEditor(action) => self.on_bookmark_editor(action),
             UiEvent::HistorySearch(q) => {
                 self.history_query = q;
                 self.refresh_history();
@@ -2758,18 +2787,129 @@ impl App {
             MenuItem::Separator,
             MenuItem::entry(3, "編輯…"),
             MenuItem::entry(4, "刪除"),
+            MenuItem::Separator,
+            MenuItem::entry(5, "書籤列依名稱排序"),
         ];
         match platform::popup_menu(&menu) {
             1 => self.open_url(url),
             2 => self.handle_ui(UiEvent::OpenUrlNewTab(url)),
-            3 => {
-                // Reuses the bookmarks page's inline editor.
-                self.show_page(Page::Bookmarks);
-                self.ui.set_editing_bookmark(idx as i32);
-            }
+            3 => self.open_bookmark_editor(idx),
             4 => self.handle_ui(UiEvent::RemoveBookmark(idx)),
+            5 => self.sort_bookmarks(""),
             _ => {}
         }
+    }
+
+    /// A bookmarks-bar folder's right-click menu.
+    fn bookmark_folder_context_menu(&mut self, path: &str) {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let menu = vec![MenuItem::entry(1, format!("「{name}」依名稱排序")), MenuItem::entry(2, "書籤列依名稱排序")];
+        match platform::popup_menu(&menu) {
+            1 => self.sort_bookmarks(path),
+            2 => self.sort_bookmarks(""),
+            _ => {}
+        }
+    }
+
+    fn sort_bookmarks(&mut self, folder: &str) {
+        self.bookmarks.sort_by_name(folder);
+        self.bookmarks.save_if_dirty();
+        self.refresh_bookmarks();
+    }
+
+    /// Moves a bookmarks-bar chip into the gap `to` (0 = before the first chip). 其他書籤 is not
+    /// on the bar's list but keeps its own place among the top-level entries.
+    fn move_bar_item(&mut self, from: usize, to: usize) {
+        let mut bar = self.bar_entries();
+        if from >= bar.len() || to > bar.len() || to == from || to == from + 1 {
+            return;
+        }
+        let entry = bar.remove(from);
+        bar.insert(if to > from { to - 1 } else { to }, entry);
+        let mut bar = bar.into_iter();
+        let order: Vec<FolderEntry> = self
+            .bookmarks
+            .folder_entries("")
+            .into_iter()
+            .map(|e| match e {
+                FolderEntry::Folder(ref path, _) if path == OTHER_FOLDER => e,
+                _ => bar.next().unwrap_or(e),
+            })
+            .collect();
+        self.bookmarks.reorder("", &order);
+        self.bookmarks.save_if_dirty();
+        self.refresh_bookmarks();
+    }
+
+    /// Edits a bookmark in a small window over the page, where the bookmarks bar asked for it,
+    /// instead of leaving the page for the bookmarks page.
+    fn open_bookmark_editor(&mut self, idx: usize) {
+        let (Some(hwnd), Some(b)) = (self.hwnd, self.bookmarks.items().get(idx)) else { return };
+        let (title, url, folder) = (b.title.clone(), b.url.clone(), b.folder.clone());
+        if self.bookmark_editor.is_none() {
+            let editor = match BookmarkEditor::new() {
+                Ok(editor) => editor,
+                Err(e) => {
+                    log!("cannot create the bookmark editor: {e}");
+                    return;
+                }
+            };
+            let action = |a: EditorAction| move || post(Event::Ui(UiEvent::BookmarkEditor(a)));
+            editor.on_save(action(EditorAction::Save));
+            editor.on_cancel(action(EditorAction::Cancel));
+            editor.on_remove(action(EditorAction::Remove));
+            editor.window().on_close_requested(|| {
+                post(Event::Ui(UiEvent::BookmarkEditor(EditorAction::Cancel)));
+                slint::CloseRequestResponse::KeepWindowShown
+            });
+            self.bookmark_editor = Some(editor);
+        }
+        let Some(editor) = &self.bookmark_editor else { return };
+        editor.set_dark(self.dark_ui());
+        // A bookmark without a real name shows an empty field, as on the bookmarks page.
+        editor.set_name_text(if title == url { SharedString::new() } else { title.into() });
+        editor.set_url_text(url.clone().into());
+        editor.set_folder_text(folder.into());
+
+        // Hang it below the pointer, where the menu was, kept inside the browser window.
+        let scale = self.ui.window().scale_factor();
+        let ((px, py), frame) = win::cursor_and_window_rect(hwnd);
+        let (w, h) = ((440.0 * scale) as i32, (250.0 * scale) as i32);
+        let x = (px - (24.0 * scale) as i32).min(frame.right - w - 8).max(frame.left + 8);
+        let y = (py + (12.0 * scale) as i32).min(frame.bottom - h - 8).max(frame.top + 8);
+        editor.window().set_position(slint::PhysicalPosition::new(x, y));
+        if let Err(e) = editor.show() {
+            log!("cannot show the bookmark editor: {e}");
+            return;
+        }
+        win::set_enabled(hwnd, false);
+        editor.invoke_begin();
+        self.editing_bookmark = Some((idx, url));
+    }
+
+    fn on_bookmark_editor(&mut self, action: EditorAction) {
+        let (Some(editor), Some((idx, url))) = (&self.bookmark_editor, self.editing_bookmark.take()) else { return };
+        // The list may have changed under the editor (an MCP call, a sync): find the bookmark again.
+        let idx = if self.bookmarks.items().get(idx).is_some_and(|b| b.url == url) {
+            Some(idx)
+        } else {
+            self.bookmarks.items().iter().position(|b| b.url == url)
+        };
+        match (action, idx) {
+            (EditorAction::Save, Some(idx)) => {
+                let (title, url, folder) = (editor.get_name_text(), editor.get_url_text(), editor.get_folder_text());
+                self.bookmarks.update(idx, &title, &url, &folder);
+            }
+            (EditorAction::Remove, Some(idx)) => self.bookmarks.remove(idx),
+            _ => {}
+        }
+        if let Some(hwnd) = self.hwnd {
+            win::set_enabled(hwnd, true);
+        }
+        let _ = editor.hide();
+        self.bookmarks.save_if_dirty();
+        self.refresh_bookmarks();
+        self.refresh_toolbar();
     }
 
     /// A bookmarks-bar folder drops down as a native menu (a Slint one would sink under the

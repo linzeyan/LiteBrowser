@@ -40,7 +40,7 @@ pub struct Bookmark {
 
 /// What a folder shows, in bookmark order: its own bookmarks, and each subfolder once, where its
 /// first bookmark is.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum FolderEntry {
     Bookmark(usize),
     /// Full path and display name.
@@ -134,6 +134,46 @@ impl Bookmarks {
             }
         }
         out
+    }
+
+    /// Puts a folder's entries (as `folder_entries` lists them) in a new order. A subfolder moves
+    /// with everything in it, and bookmarks outside `folder` keep their places: the folder's
+    /// bookmarks are written back into the positions they held. Anything but a rearrangement of
+    /// exactly those entries is ignored.
+    pub fn reorder(&mut self, folder: &str, order: &[FolderEntry]) {
+        let within = |b: &Bookmark, path: &str| {
+            path.is_empty() || b.folder == path || b.folder.strip_prefix(path).is_some_and(|rest| rest.starts_with('/'))
+        };
+        let slots: Vec<usize> = (0..self.items.len()).filter(|&i| within(&self.items[i], folder)).collect();
+        let mut sequence = Vec::with_capacity(slots.len());
+        for entry in order {
+            match entry {
+                FolderEntry::Bookmark(i) => sequence.push(*i),
+                FolderEntry::Folder(path, _) => {
+                    sequence.extend((0..self.items.len()).filter(|&i| within(&self.items[i], path)))
+                }
+            }
+        }
+        let mut taken = sequence.clone();
+        taken.sort_unstable();
+        if taken != slots {
+            return;
+        }
+        let old = self.items.clone();
+        for (slot, from) in slots.into_iter().zip(sequence) {
+            self.items[slot] = old[from].clone();
+        }
+        self.dirty = true;
+    }
+
+    /// Sorts a folder's entries by name like Chrome's "Sort by name": subfolders first.
+    pub fn sort_by_name(&mut self, folder: &str) {
+        let mut entries = self.folder_entries(folder);
+        entries.sort_by_cached_key(|e| match e {
+            FolderEntry::Folder(_, name) => (0, name.to_lowercase()),
+            FolderEntry::Bookmark(i) => (1, self.items[*i].title.to_lowercase()),
+        });
+        self.reorder(folder, &entries);
     }
 
     pub fn remove(&mut self, index: usize) {
@@ -476,6 +516,52 @@ mod tests {
         b.file_if_loose("https://w1.com", "其他書籤");
         assert_eq!(b.items()[0].folder, "其他書籤");
         assert_eq!(b.items()[1].folder, "工作");
+    }
+
+    fn titles(b: &Bookmarks) -> Vec<&str> {
+        b.items().iter().map(|x| x.title.as_str()).collect()
+    }
+
+    #[test]
+    fn a_folder_moves_with_everything_in_it() {
+        let dir = temp_dir("bm-reorder");
+        let mut b = Bookmarks::load(&dir.join("b.json"));
+        b.add("https://a.com", "A", "");
+        b.add("https://w1.com", "W1", "工作");
+        b.add("https://b.com", "B", "");
+        b.add("https://p.com", "P", "工作/專案");
+        b.add("https://w2.com", "W2", "工作");
+        use FolderEntry::*;
+        // Drag 工作 to the bar's end: its three bookmarks go after B, in their own order.
+        let work = Folder("工作".into(), "工作".into());
+        b.reorder("", &[Bookmark(0), Bookmark(2), work.clone()]);
+        assert_eq!(titles(&b), ["A", "B", "W1", "P", "W2"]);
+        assert_eq!(b.folder_entries(""), vec![Bookmark(0), Bookmark(1), work]);
+
+        // Inside a folder only that folder's places are reused; the bar's bookmarks stay put.
+        b.reorder("工作", &[Folder("工作/專案".into(), "專案".into()), Bookmark(4), Bookmark(2)]);
+        assert_eq!(titles(&b), ["A", "B", "P", "W2", "W1"]);
+
+        // Not a rearrangement of exactly the folder's entries: nothing happens.
+        let before = titles(&b).join(",");
+        b.reorder("", &[Bookmark(0)]);
+        b.reorder("", &[Bookmark(0), Bookmark(0), Bookmark(1), Folder("工作".into(), "工作".into())]);
+        assert_eq!(titles(&b).join(","), before);
+    }
+
+    #[test]
+    fn sorting_by_name_puts_folders_first() {
+        let dir = temp_dir("bm-sort");
+        let mut b = Bookmarks::load(&dir.join("b.json"));
+        b.add("https://z.com", "zeta", "");
+        b.add("https://o.com", "Other", "其他書籤");
+        b.add("https://a.com", "Alpha", "");
+        b.add("https://w.com", "W", "工作");
+        b.add("https://b.com", "beta", "");
+        b.sort_by_name("");
+        // Folders 其他書籤, 工作 (by code point: 其 U+5176 < 工 U+5DE5), then bookmarks, ignoring case.
+        assert_eq!(titles(&b), ["Other", "W", "Alpha", "beta", "zeta"]);
+        assert!(b.dirty);
     }
 
     #[test]

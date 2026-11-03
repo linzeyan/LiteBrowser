@@ -26,6 +26,8 @@ slint = { version = "1.18", default-features = false, features = [
     "backend-winit",
     "renderer-software",
     "raw-window-handle-06",
+    # For the window attributes hook, the one way to create a window owned by another (win.rs).
+    "unstable-winit-030",
 ] }
 raw-window-handle = "0.6"
 webview2-com = "0.39"

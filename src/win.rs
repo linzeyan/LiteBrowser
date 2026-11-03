@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller;
 use windows::core::{HSTRING, PCWSTR};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetFocus, GetKeyState, GetKeyboardState, SetFocus, SetKeyboardState, VK_CAPITAL, VK_CONTROL, VK_MENU,
 };
@@ -30,6 +30,28 @@ thread_local! {
     /// Whether the last mouse press in a web page asks for a background tab (middle, or left with
     /// Ctrl), and when it happened.
     static PAGE_PRESS: Cell<Option<(bool, Instant)>> = const { Cell::new(None) };
+    /// Owner for every window Slint creates once the main window is up; see `own_later_windows`.
+    static DIALOG_OWNER: Cell<Option<HWND>> = const { Cell::new(None) };
+}
+
+/// Picks Slint's winit backend with a hook that lets `own_later_windows` hand windows their owner.
+pub fn select_backend() -> Result<(), slint::PlatformError> {
+    use slint::winit_030::winit::platform::windows::WindowAttributesExtWindows;
+    slint::BackendSelector::new()
+        .with_winit_window_attributes_hook(|attributes| match DIALOG_OWNER.get() {
+            Some(owner) => attributes.with_owner_window(owner.0 as isize),
+            None => attributes,
+        })
+        .select()
+}
+
+/// Makes every window Slint creates from now on owned by `owner`, as a modal dialog is: above it,
+/// no taskbar button of its own, and minimized with it. Winit only does this for a window created
+/// owned; given an owner afterwards, it puts WS_EX_APPWINDOW back each time the window is shown.
+/// It is set once rather than around `show()` because Slint creates the window later, on the
+/// event loop.
+pub fn own_later_windows(owner: HWND) {
+    DIALOG_OWNER.set(Some(owner));
 }
 
 pub fn set_active_controller(controller: Option<ICoreWebView2Controller>) {
@@ -283,6 +305,26 @@ pub fn restore_page_focus(hwnd: HWND) {
             let _ = SetFocus(Some(page));
         }
     }
+}
+
+/// Turns input to a window (its WebViews included) off while a dialog of its is up, and back on.
+/// Enabling it before the dialog hides is what makes Windows activate it again afterwards.
+pub fn set_enabled(hwnd: HWND, enabled: bool) {
+    unsafe {
+        let _ = windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow(hwnd, enabled);
+    }
+}
+
+/// The mouse pointer and a window's rectangle, in screen pixels.
+pub fn cursor_and_window_rect(hwnd: HWND) -> ((i32, i32), RECT) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{GetCursorPos, GetWindowRect};
+    let (mut pt, mut rect) = (POINT::default(), RECT::default());
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+        let _ = GetWindowRect(hwnd, &mut rect);
+    }
+    ((pt.x, pt.y), rect)
 }
 
 /// Opens a folder or file with its default application (Explorer for folders).

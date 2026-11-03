@@ -811,17 +811,31 @@ component BarChip inherits Rectangle {
     in property <image> favicon;
     in property <bool> folder;
     in property <bool> named: true;
+    // This chip is being dragged to a new place on the bar.
+    in property <bool> dragging;
     callback clicked;
     callback middle-clicked;
     callback right-clicked;
+    // The left button went down / moved / came up, with the pointer's x in window coordinates;
+    // released(false) when the press was lost. As TabItem's, for dragging the chip along the bar.
+    callback pressed(length);
+    callback dragged(length);
+    callback released(bool);
     // Ctrl as of the left press: TouchArea emits `clicked` before the release's pointer event.
     property <bool> ctrl-press;
 
     border-radius: 14px;
-    background: touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    background: root.dragging ? Theme.hover : touch.pressed ? Theme.pressed : touch.has-hover ? Theme.hover : transparent;
+    opacity: root.dragging ? 0.5 : 1;
     max-width: 180px;
 
     touch := TouchArea {
+        mouse-cursor: root.dragging ? MouseCursor.grabbing : MouseCursor.default;
+        moved => {
+            if (self.pressed) {
+                root.dragged(self.absolute-position.x + self.mouse-x);
+            }
+        }
         clicked => {
             // A folder still opens its menu; there is no tab to open it in.
             if (root.ctrl-press && !root.folder) {
@@ -833,6 +847,11 @@ component BarChip inherits Rectangle {
         pointer-event(e) => {
             if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
                 root.ctrl-press = e.modifiers.control;
+                root.pressed(self.absolute-position.x + self.mouse-x);
+            } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                root.released(true);
+            } else if (e.kind == PointerEventKind.cancel) {
+                root.released(false);
             } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.middle) {
                 root.middle-clicked();
             } else if (e.kind == PointerEventKind.up && e.button == PointerEventButton.right) {
@@ -1365,6 +1384,10 @@ export component AppWindow inherits Window {
     // The bookmarks bar's » button: the first chip that did not fit, and the button's bottom-right
     // corner, where the menu of the hidden chips hangs from.
     callback bookmark-overflow-menu(int, length, length);
+    // Right-click on a bookmarks-bar folder: its path.
+    callback bookmark-folder-context-menu(string);
+    // A bookmarks-bar chip was dragged from its place to a gap between chips (0 = before the first).
+    callback move-bar-item(int, int);
     callback history-search(string);
     callback remove-history(string);
     callback clear-history();
@@ -1825,6 +1848,19 @@ export component AppWindow inherits Window {
                 // Where the » menu starts.
                 property <int> first-hidden;
 
+                // Dragging a chip: unlike tabs the chips have their own widths, so the chip stays put
+                // (dimmed) and a mark shows the gap it will drop into. drop-index is a gap, 0..count;
+                // each chip claims the gaps on either side of its middle as the pointer crosses it.
+                property <int> drag-index: -1;
+                property <length> drag-start;
+                property <length> drag-x;
+                // A few pixels of slack, so a click that wobbles stays a click.
+                property <bool> dragging: self.drag-index >= 0 && Math.abs(self.drag-x - self.drag-start) > 6px;
+                property <int> drop-index: -1;
+                property <length> drop-x;
+                property <int> last-shown: self.overflow ? self.first-hidden - 1 : root.bar-items.length - 1;
+                property <bool> moves: self.dragging && self.drop-index >= 0 && self.drop-index != self.drag-index && self.drop-index != self.drag-index + 1;
+
                 chips := Rectangle {
                     x: 8px;
                     y: 2px;
@@ -1842,6 +1878,25 @@ export component AppWindow inherits Window {
                         // element, which becomes the root of its own component.
                         for b[i] in root.bar-items: slot := Rectangle {
                             property <bool> fits: self.x + self.width <= chips.width;
+                            property <length> middle: self.absolute-position.x + self.width / 2;
+                            // The first chip also takes everything left of it, the last everything
+                            // right of it (including the » button).
+                            property <bool> over-left: bookmarks-bar.dragging && self.fits
+                                && bookmarks-bar.drag-x < self.middle && (i == 0 || bookmarks-bar.drag-x >= self.absolute-position.x - 2px);
+                            property <bool> over-right: bookmarks-bar.dragging && self.fits
+                                && bookmarks-bar.drag-x >= self.middle && (i == bookmarks-bar.last-shown || bookmarks-bar.drag-x < self.absolute-position.x + self.width + 2px);
+                            changed over-left => {
+                                if (self.over-left) {
+                                    bookmarks-bar.drop-index = i;
+                                    bookmarks-bar.drop-x = self.x - 1px;
+                                }
+                            }
+                            changed over-right => {
+                                if (self.over-right) {
+                                    bookmarks-bar.drop-index = i + 1;
+                                    bookmarks-bar.drop-x = self.x + self.width + 1px;
+                                }
+                            }
                             // Chips run left to right, so the first one past the edge is the only
                             // hidden one that still starts within reach.
                             property <bool> first-out: !self.fits && self.x <= chips.width + 2px;
@@ -1864,11 +1919,15 @@ export component AppWindow inherits Window {
                                     folder: b.folder;
                                     // A bookmark with no real name (title == url) shows just its icon.
                                     named: b.folder || (b.title != "" && b.title != b.url);
+                                    dragging: bookmarks-bar.dragging && bookmarks-bar.drag-index == i;
                                     clicked => {
-                                        if (b.folder) {
-                                            root.bookmark-folder-menu(b.url, self.absolute-position.x, self.absolute-position.y + self.height);
-                                        } else {
-                                            root.open-url(b.url);
+                                        // The release that ends a drag is not a click.
+                                        if (!bookmarks-bar.dragging) {
+                                            if (b.folder) {
+                                                root.bookmark-folder-menu(b.url, self.absolute-position.x, self.absolute-position.y + self.height);
+                                            } else {
+                                                root.open-url(b.url);
+                                            }
                                         }
                                     }
                                     middle-clicked => {
@@ -1877,14 +1936,43 @@ export component AppWindow inherits Window {
                                         }
                                     }
                                     right-clicked => {
-                                        if (!b.folder) {
+                                        if (b.folder) {
+                                            root.bookmark-folder-context-menu(b.url);
+                                        } else {
                                             root.bookmark-menu(b.index);
                                         }
+                                    }
+                                    pressed(px) => {
+                                        bookmarks-bar.drag-index = i;
+                                        bookmarks-bar.drag-start = px;
+                                        bookmarks-bar.drag-x = px;
+                                        bookmarks-bar.drop-index = -1;
+                                    }
+                                    dragged(px) => {
+                                        if (bookmarks-bar.drag-index == i) {
+                                            bookmarks-bar.drag-x = px;
+                                        }
+                                    }
+                                    released(commit) => {
+                                        if (commit && bookmarks-bar.moves) {
+                                            root.move-bar-item(i, bookmarks-bar.drop-index);
+                                        }
+                                        bookmarks-bar.drag-index = -1;
+                                        bookmarks-bar.drop-index = -1;
                                     }
                                 }
                             }
                         }
                     }
+                }
+
+                if bookmarks-bar.moves: Rectangle {
+                    x: chips.x + bookmarks-bar.drop-x - 1px;
+                    y: 6px;
+                    width: 2px;
+                    height: parent.height - 12px;
+                    border-radius: 1px;
+                    background: Theme.accent;
                 }
 
                 if bookmarks-bar.overflow: IconButton {
@@ -1916,6 +2004,9 @@ export component AppWindow inherits Window {
                     folder: true;
                     clicked => {
                         root.bookmark-folder-menu(root.other-folder, self.absolute-position.x, self.absolute-position.y + self.height);
+                    }
+                    right-clicked => {
+                        root.bookmark-folder-context-menu(root.other-folder);
                     }
                 }
             }
@@ -3375,5 +3466,140 @@ export component AppWindow inherits Window {
     // the whole window again; Rust does that when Windows asks for such a spot (win.rs, WM_PAINT).
     Rectangle {
         background: root.repaint ? #ffffff00 : #00000000;
+    }
+}
+
+// The bookmark editor the bookmarks bar opens. A window of its own, owned by the main window
+// (win.rs): anything Slint draws inside the main window sinks under the WebView.
+export component BookmarkEditor inherits Window {
+    in property <bool> dark;
+    in-out property <string> name-text;
+    in-out property <string> url-text;
+    in-out property <string> folder-text;
+    callback save();
+    callback cancel();
+    callback remove();
+
+    title: "編輯書籤";
+    no-frame: true;
+    width: 440px;
+    background: Theme.surface;
+    default-font-size: 13px;
+    forward-focus: name-edit;
+
+    function apply-theme() {
+        Theme.dark = root.dark;
+        Palette.color-scheme = root.dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    init => {
+        root.apply-theme();
+    }
+    changed dark => {
+        root.apply-theme();
+    }
+
+    public function begin() {
+        name-edit.focus();
+        name-edit.select-all();
+    }
+
+    // The software renderer has no shadows; a 1px outline sets the window off the page behind it.
+    Rectangle {
+        border-width: 1px;
+        border-color: Theme.outline;
+    }
+
+    FocusScope {
+        capture-key-pressed(e) => {
+            if (e.text == Key.Escape) {
+                root.cancel();
+                return accept;
+            }
+            return reject;
+        }
+
+        VerticalLayout {
+            padding: 20px;
+            spacing: 14px;
+
+            Text {
+                text: "編輯書籤";
+                font-size: 16px;
+                font-weight: 600;
+                color: Theme.text;
+            }
+
+            GridLayout {
+                spacing: 8px;
+                Row {
+                    Text {
+                        text: "名稱";
+                        vertical-alignment: center;
+                        color: Theme.dim;
+                    }
+                    name-edit := LineEdit {
+                        text <=> root.name-text;
+                        accepted => {
+                            root.save();
+                        }
+                    }
+                }
+                Row {
+                    Text {
+                        text: "網址";
+                        vertical-alignment: center;
+                        color: Theme.dim;
+                    }
+                    LineEdit {
+                        text <=> root.url-text;
+                        accepted => {
+                            root.save();
+                        }
+                    }
+                }
+                Row {
+                    Text {
+                        text: "資料夾";
+                        vertical-alignment: center;
+                        color: Theme.dim;
+                    }
+                    // Typing a new name makes a new folder; "/" nests one, as on the bookmarks page.
+                    LineEdit {
+                        text <=> root.folder-text;
+                        placeholder-text: "空白＝書籤列";
+                        accepted => {
+                            root.save();
+                        }
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                PillButton {
+                    text: "刪除";
+                    clicked => {
+                        root.remove();
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+                PillButton {
+                    text: "取消";
+                    clicked => {
+                        root.cancel();
+                    }
+                }
+                PillButton {
+                    text: "儲存";
+                    primary: true;
+                    enabled: root.url-text != "";
+                    clicked => {
+                        root.save();
+                    }
+                }
+            }
+        }
     }
 }
