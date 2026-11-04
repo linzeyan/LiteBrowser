@@ -152,6 +152,7 @@ global Icons {
     out property <string> search: "M 4 10 A 6 6 0 1 0 16 10 A 6 6 0 1 0 4 10 M 14.5 14.5 L 20 20";
     out property <string> globe: "M 3.5 12 A 8.5 8.5 0 1 0 20.5 12 A 8.5 8.5 0 1 0 3.5 12 M 3.5 12 L 20.5 12 M 12 3.5 A 5 8.5 0 0 0 12 20.5 A 5 8.5 0 0 0 12 3.5";
     out property <string> import: "M 12 3 L 12 15 M 7 10 L 12 15 L 17 10 M 4 20 L 20 20";
+    out property <string> download: "M 12 4 L 12 15 M 7.5 10.5 L 12 15 L 16.5 10.5 M 5 19.5 L 19 19.5";
     out property <string> key: "M 3.5 12 A 4 4 0 1 0 11.5 12 A 4 4 0 1 0 3.5 12 M 11.5 12 L 20.5 12 M 17.5 12 L 17.5 15 M 20.5 12 L 20.5 15";
     out property <string> eye: "M 2.5 12 Q 12 3 21.5 12 Q 12 21 2.5 12 Z M 9 12 A 3 3 0 1 0 15 12 A 3 3 0 1 0 9 12";
     out property <string> eye-off: "M 2.5 12 Q 12 3 21.5 12 Q 12 21 2.5 12 Z M 9 12 A 3 3 0 1 0 15 12 A 3 3 0 1 0 9 12 M 4 4 L 20 20";
@@ -1324,6 +1325,11 @@ export component AppWindow inherits Window {
     in property <bool> update-checking;
     // The version downloaded and waiting for a restart, or "".
     in property <string> update-downloaded;
+    // The toolbar's download button: there once a page downloaded something this session.
+    in property <bool> downloads-visible;
+    in property <bool> downloading;
+    // A download finished since the list was last opened.
+    in property <bool> download-done;
     // Flipped to repaint the whole window; see the Rectangle at the end.
     in property <bool> repaint;
 
@@ -1816,6 +1822,32 @@ export component AppWindow inherits Window {
 
                     Rectangle {
                         width: 6px;
+                    }
+
+                    // Chrome's download button: finished downloads wait behind it instead of a list
+                    // popping up over the page.
+                    if root.downloads-visible: Rectangle {
+                        width: 34px;
+                        height: 34px;
+
+                        IconButton {
+                            icon: Icons.download;
+                            icon-color: root.downloading ? Theme.accent : Theme.icon;
+                            clicked => {
+                                root.command("downloads");
+                            }
+                        }
+
+                        if root.download-done && !root.downloading: Rectangle {
+                            x: 21px;
+                            y: 6px;
+                            width: 9px;
+                            height: 9px;
+                            border-radius: self.width / 2;
+                            background: Theme.accent;
+                            border-width: 1.5px;
+                            border-color: Theme.surface;
+                        }
                     }
 
                     IconButton {

@@ -5,7 +5,7 @@
 //! re-entered while it is already running.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -29,7 +29,7 @@ use crate::storage::{
 };
 use crate::tabs::{self, Action, MemoryState, Policy, Residency, TabId, TabSnapshot};
 use crate::url_input;
-use crate::webview::{self, EngineEvent, ExtensionChange, ExtensionInfo, NewWindowRequest, WebView};
+use crate::webview::{self, DownloadState, EngineEvent, ExtensionChange, ExtensionInfo, NewWindowRequest, WebView};
 use crate::{crx, devtools, mcp, update, win};
 
 slint::include_modules!();
@@ -92,8 +92,10 @@ pub enum Event {
     DevtoolsViewCreated(Result<ICoreWebView2Controller, String>),
     /// The hidden WebView that gives the extensions page a profile finished being created.
     ExtensionHostCreated(Result<ICoreWebView2Controller, String>),
-    /// Each renderer PID with the ids of the frames it runs.
-    RendererFrames(Vec<(u32, Vec<u32>)>),
+    /// Every WebView2 process, with the pages each renderer runs frames of.
+    EngineProcesses(Vec<webview::EngineProcess>),
+    /// A download started, finished, or moved between running and interrupted.
+    Download { id: u64, state: DownloadState, path: String },
     /// The background update check moved on.
     Update(UpdateStep),
     /// Windows asked to paint a part of the window that something had covered.
@@ -730,6 +732,10 @@ struct App {
     restart: bool,
     /// An update check (and download) is running in the background.
     update_checking: bool,
+    /// Page downloads still running, by id.
+    downloads_running: HashSet<u64>,
+    /// Where the last finished download was saved.
+    last_download: Option<PathBuf>,
 }
 
 impl App {
@@ -824,6 +830,8 @@ impl App {
             logged_window_state: String::new(),
             restart: false,
             update_checking: false,
+            downloads_running: HashSet::new(),
+            last_download: None,
         };
         if let Some(e) = cfg_error {
             log!("{e}");
@@ -884,7 +892,8 @@ impl App {
             }
             Event::DevtoolsViewCreated(result) => self.on_devtools_view_created(result),
             Event::ExtensionHostCreated(result) => self.on_extension_host_created(result),
-            Event::RendererFrames(renderers) => self.on_renderer_frames(renderers),
+            Event::EngineProcesses(processes) => self.on_engine_processes(processes),
+            Event::Download { id, state, path } => self.on_download(id, state, path),
             Event::Update(step) => self.on_update(step),
             Event::RepaintAll => self.ui.set_repaint(!self.ui.get_repaint()),
             Event::Tick => self.tick(),
@@ -1239,9 +1248,17 @@ impl App {
             Shortcut::ShowBookmarks => self.show_page(Page::Bookmarks),
             Shortcut::ShowHistory => self.show_page(Page::History),
             Shortcut::ShowDownloads => {
+                self.ui.set_download_done(false);
                 let opened = self.tabs[self.active].view.as_ref().is_some_and(WebView::open_downloads);
                 if !opened {
-                    self.set_status("下載清單要在網頁分頁中開啟");
+                    // WebView2's list lives inside a page; without one, the folder is the next best.
+                    match self.last_download.as_deref().and_then(Path::parent) {
+                        Some(dir) => {
+                            win::shell_open(dir);
+                            self.set_status("這個分頁不能顯示下載清單，已開啟下載資料夾");
+                        }
+                        None => self.set_status("下載清單要在網頁分頁中開啟"),
+                    }
                 }
             }
             Shortcut::Reload => self.reload_active(),
@@ -1753,10 +1770,24 @@ impl App {
         }
     }
 
-    fn on_renderer_frames(&mut self, renderers: Vec<(u32, Vec<u32>)>) {
+    fn on_engine_processes(&mut self, processes: Vec<webview::EngineProcess>) {
+        let bytes: HashMap<u32, u64> = processes.iter().map(|p| (p.pid, memory::private_memory(p.pid))).collect();
         let frames: Vec<Option<u32>> = self.tabs.iter().map(|t| t.view.as_ref().and_then(WebView::frame_id)).collect();
-        for (tab, bytes) in self.tabs.iter_mut().zip(memory::per_tab(&frames, &renderers, memory::private_memory)) {
+        let renderers: Vec<(u32, Vec<u32>)> =
+            processes.iter().filter(|p| p.kind == "renderer").map(|p| (p.pid, p.pages.clone())).collect();
+        let size = |pid: u32| bytes.get(&pid).copied().unwrap_or(0);
+        for (tab, bytes) in self.tabs.iter_mut().zip(memory::per_tab(&frames, &renderers, size)) {
             tab.bytes = bytes;
+        }
+        // What the browser holds besides its tabs, so a log can tell a leak (a renderer no tab
+        // owns) from the shared processes every page needs.
+        if logging::enabled(Level::Trace) {
+            let rows: Vec<_> = processes.iter().map(|p| (p.kind, p.pages.as_slice(), size(p.pid))).collect();
+            trace!(
+                "memory by process: app {} MB, {}",
+                memory::private_memory(std::process::id()) >> 20,
+                memory::by_kind(&rows, &frames)
+            );
         }
     }
 
@@ -2005,6 +2036,29 @@ impl App {
         self.activate(idx);
     }
 
+    fn on_download(&mut self, id: u64, state: DownloadState, path: String) {
+        match state {
+            DownloadState::InProgress => {
+                if !self.downloads_running.insert(id) {
+                    return;
+                }
+            }
+            // StateChanged can repeat; only a running download can finish.
+            DownloadState::Completed | DownloadState::Interrupted => {
+                if !self.downloads_running.remove(&id) {
+                    return;
+                }
+            }
+        }
+        debug!("download {id}: {state:?}");
+        if state == DownloadState::Completed {
+            self.last_download = Some(PathBuf::from(path));
+            self.ui.set_download_done(true);
+        }
+        self.ui.set_downloads_visible(true);
+        self.ui.set_downloading(!self.downloads_running.is_empty());
+    }
+
     fn on_browser_gone(&mut self) {
         if self.env.is_none() {
             return; // already restarting
@@ -2016,6 +2070,9 @@ impl App {
         }
         win::set_active_controller(None);
         self.env = None;
+        // The browser process took its downloads with it.
+        self.downloads_running.clear();
+        self.ui.set_downloading(false);
         self.extensions_synced = false;
         self.extension_host = None;
         self.extension_host_creating = false;
@@ -2499,7 +2556,7 @@ impl App {
         self.apply_policy(Some(MemoryState { browser_bytes: self.usage.bytes, system_free_bytes: sys.free_bytes }));
         // Per-tab sizes for the next round's policy: the answer comes back asynchronously.
         if let Some(env) = &self.env {
-            webview::renderer_frames(env, |renderers| post(Event::RendererFrames(renderers)));
+            webview::engine_processes(env, |processes| post(Event::EngineProcesses(processes)));
         }
         // Every message is a one-off notice ("bookmark added", "private tab: …"); left up, it
         // goes on describing a tab or an action that is long gone.
@@ -2587,7 +2644,9 @@ impl App {
 
     fn refresh_title(&self) {
         let title = self.tabs.get(self.active).map(|t| t.title.as_str()).unwrap_or("");
-        let title = if title.is_empty() { "LiteBrowser".to_string() } else { format!("{title} - LiteBrowser") };
+        // App name first: with only our own process left (no WebView2 children), Win10's Task
+        // Manager names the app after the window title, so it should still read "LiteBrowser".
+        let title = if title.is_empty() { "LiteBrowser".to_string() } else { format!("LiteBrowser - {title}") };
         self.ui.set_window_title(title.into());
     }
 

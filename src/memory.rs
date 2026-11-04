@@ -80,8 +80,8 @@ fn started(pid: u32) -> Option<u64> {
 }
 
 /// Splits renderer memory over tabs. `tab_frames` is each tab's main frame id (None without a
-/// WebView); `renderers` is each renderer PID with the ids of the frames it runs. Tabs of the
-/// same site share a renderer, so each gets an equal share of it.
+/// WebView); `renderers` is each renderer PID with the main-frame ids of the pages it runs frames
+/// of. Tabs of the same site share a renderer, so each gets an equal share of it.
 pub fn per_tab(tab_frames: &[Option<u32>], renderers: &[(u32, Vec<u32>)], bytes: impl Fn(u32) -> u64) -> Vec<u64> {
     let mut out = vec![0; tab_frames.len()];
     for (pid, frames) in renderers {
@@ -96,6 +96,30 @@ pub fn per_tab(tab_frames: &[Option<u32>], renderers: &[(u32, Vec<u32>)], bytes:
         }
     }
     out
+}
+
+/// One line of where the engine's memory sits: per process kind, the count and total MB, with
+/// renderers split by whether any open tab owns them. `processes` is (kind, pages run, bytes).
+pub fn by_kind(processes: &[(&str, &[u32], u64)], tab_frames: &[Option<u32>]) -> String {
+    let mut rows: Vec<(String, usize, u64)> = Vec::new();
+    for &(kind, pages, bytes) in processes {
+        let label = if kind != "renderer" {
+            kind.to_string()
+        } else if pages.iter().any(|p| tab_frames.contains(&Some(*p))) {
+            "renderer".to_string()
+        } else {
+            // Spare renderers, DevTools, the extensions page's hidden view — or a leak.
+            "renderer without a tab".to_string()
+        };
+        match rows.iter_mut().find(|r| r.0 == label) {
+            Some(row) => {
+                row.1 += 1;
+                row.2 += bytes;
+            }
+            None => rows.push((label, 1, bytes)),
+        }
+    }
+    rows.iter().map(|(label, n, bytes)| format!("{label} {n}×{} MB", bytes >> 20)).collect::<Vec<_>>().join(", ")
 }
 
 pub fn private_memory(pid: u32) -> u64 {
@@ -154,6 +178,20 @@ mod tests {
         let renderers = [(100, vec![1, 2]), (200, vec![3, 8]), (300, vec![9])];
         let bytes = |pid: u32| u64::from(pid);
         assert_eq!(per_tab(&tab_frames, &renderers, bytes), vec![50, 50, 200, 0]);
+    }
+
+    #[test]
+    fn renderers_no_open_tab_owns_are_reported_apart() {
+        // A renderer left behind by a closed tab is what a leak looks like in the log, so it must
+        // not hide among the ones that run pages.
+        const MB: u64 = 1 << 20;
+        let tab_frames = [Some(1), None];
+        let processes: [(&str, &[u32], u64); 4] =
+            [("browser", &[], 60 * MB), ("renderer", &[1], 300 * MB), ("renderer", &[7], 40 * MB), ("gpu", &[], 90 * MB)];
+        assert_eq!(
+            by_kind(&processes, &tab_frames),
+            "browser 1×60 MB, renderer 1×300 MB, renderer without a tab 1×40 MB, gpu 1×90 MB"
+        );
     }
 
     #[test]

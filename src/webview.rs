@@ -6,6 +6,7 @@
 use std::cell::Cell;
 use std::path::Path;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use webview2_com::Microsoft::Web::WebView2::Win32::*;
 use webview2_com::{
@@ -14,11 +15,12 @@ use webview2_com::{
     ExecuteScriptCompletedHandler, GetProcessExtendedInfosCompletedHandler,
     BrowserExtensionRemoveCompletedHandler, CoreWebView2EnvironmentOptions, CreateCoreWebView2ControllerCompletedHandler,
     CreateCoreWebView2EnvironmentCompletedHandler, DevToolsProtocolEventReceivedEventHandler,
-    DocumentTitleChangedEventHandler, FaviconChangedEventHandler,
+    DocumentTitleChangedEventHandler, DownloadStartingEventHandler, FaviconChangedEventHandler,
     GetFaviconCompletedHandler, HistoryChangedEventHandler, IsDocumentPlayingAudioChangedEventHandler,
     NavigationCompletedEventHandler,
     NavigationStartingEventHandler, NewWindowRequestedEventHandler, ProcessFailedEventHandler,
     ProfileAddBrowserExtensionCompletedHandler, ProfileGetBrowserExtensionsCompletedHandler, SourceChangedEventHandler,
+    StateChangedEventHandler,
     TrySuspendCompletedHandler, WebMessageReceivedEventHandler, WebResourceRequestedEventHandler,
     WindowCloseRequestedEventHandler, ZoomFactorChangedEventHandler,
 };
@@ -122,6 +124,19 @@ impl NewWindowRequest {
 }
 
 const MIN_RUNTIME_VERSION: &str = "100.0.1185.36";
+
+/// Where a download stands. Downloads belong to the browser, not to the tab that started them:
+/// they go on when that tab closes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DownloadState {
+    InProgress,
+    Completed,
+    /// Failed or canceled; a resumed download reports InProgress again.
+    Interrupted,
+}
+
+/// Tells downloads apart.
+static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(1);
 
 fn post_engine(tab: TabId, event: EngineEvent) {
     post(Event::Engine(tab, event));
@@ -595,6 +610,41 @@ impl WebView {
                 )?;
             }
 
+            // Downloads: WebView2's list would pop up over the page for every one; the toolbar's
+            // download button reports them instead and opens the list when clicked.
+            // ICoreWebView2_4 (runtime 92).
+            if let Ok(wv4) = core.cast::<ICoreWebView2_4>() {
+                wv4.add_DownloadStarting(
+                    &DownloadStartingEventHandler::create(Box::new(move |_, args| {
+                        let Some(args) = args else { return Ok(()) };
+                        args.SetHandled(true)?;
+                        let download = args.DownloadOperation()?;
+                        let id = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
+                        post(Event::Download { id, state: DownloadState::InProgress, path: String::new() });
+                        let mut token = 0i64;
+                        download.add_StateChanged(
+                            &StateChangedEventHandler::create(Box::new(move |sender, _| {
+                                let Some(download) = sender else { return Ok(()) };
+                                let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
+                                download.State(&mut state)?;
+                                let mut path = PWSTR::null();
+                                download.ResultFilePath(&mut path)?;
+                                let state = match state {
+                                    COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED => DownloadState::Completed,
+                                    COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS => DownloadState::InProgress,
+                                    _ => DownloadState::Interrupted,
+                                };
+                                post(Event::Download { id, state, path: take_pwstr(path) });
+                                Ok(())
+                            })),
+                            &mut token,
+                        )?;
+                        Ok(())
+                    })),
+                    &mut token,
+                )?;
+            }
+
             if let Some(blocklist) = blocklist {
                 install_blocker(core, env, tab, blocklist)?;
             }
@@ -839,16 +889,22 @@ impl WebView {
     }
 }
 
-/// Which frames each renderer process runs: `done` gets every renderer's PID with the ids of its
-/// frames. Needs ICoreWebView2Environment13; older runtimes never call `done`.
-// ponytail: only a page's main frame matches a tab, so a cross-site iframe in a renderer of its
-// own isn't counted for its page; walk `ICoreWebView2FrameInfo2::ParentFrameInfo` up to the main
-// frame if the largest-first ranking turns out wrong.
-pub fn renderer_frames(env: &ICoreWebView2Environment, done: impl FnOnce(Vec<(u32, Vec<u32>)>) + 'static) {
+/// One WebView2 process. For a renderer, `pages` holds the main-frame id of every page it runs a
+/// frame of: a cross-site iframe in a renderer of its own (ads, embeds, Polymarket's widgets)
+/// counts toward the page that embeds it, which is what goes when that page is discarded.
+pub struct EngineProcess {
+    pub pid: u32,
+    pub kind: &'static str,
+    pub pages: Vec<u32>,
+}
+
+/// Every WebView2 process but crashpad, for per-tab memory and the trace log's breakdown. Needs
+/// ICoreWebView2Environment13; older runtimes never call `done`.
+pub fn engine_processes(env: &ICoreWebView2Environment, done: impl FnOnce(Vec<EngineProcess>) + 'static) {
     let Ok(env13) = env.cast::<ICoreWebView2Environment13>() else { return };
     let handler = GetProcessExtendedInfosCompletedHandler::create(Box::new(move |result, infos| {
         if let (Ok(()), Some(infos)) = (result, infos) {
-            done(unsafe { read_renderers(&infos) });
+            done(unsafe { read_processes(&infos) });
         }
         Ok(())
     }));
@@ -857,7 +913,7 @@ pub fn renderer_frames(env: &ICoreWebView2Environment, done: impl FnOnce(Vec<(u3
     }
 }
 
-unsafe fn read_renderers(infos: &ICoreWebView2ProcessExtendedInfoCollection) -> Vec<(u32, Vec<u32>)> {
+unsafe fn read_processes(infos: &ICoreWebView2ProcessExtendedInfoCollection) -> Vec<EngineProcess> {
     let mut out = Vec::new();
     let mut count = 0;
     let _ = infos.Count(&mut count);
@@ -865,20 +921,26 @@ unsafe fn read_renderers(infos: &ICoreWebView2ProcessExtendedInfoCollection) -> 
         let Ok(info) = infos.GetValueAtIndex(i) else { continue };
         let Ok(process) = info.ProcessInfo() else { continue };
         let (mut kind, mut pid) = (COREWEBVIEW2_PROCESS_KIND::default(), 0);
-        if process.Kind(&mut kind).is_err() || kind != COREWEBVIEW2_PROCESS_KIND_RENDERER || process.ProcessId(&mut pid).is_err() {
+        if process.Kind(&mut kind).is_err() || process.ProcessId(&mut pid).is_err() {
             continue;
         }
-        let mut frames = Vec::new();
+        let kind = match kind {
+            COREWEBVIEW2_PROCESS_KIND_BROWSER => "browser",
+            COREWEBVIEW2_PROCESS_KIND_RENDERER => "renderer",
+            COREWEBVIEW2_PROCESS_KIND_GPU => "gpu",
+            COREWEBVIEW2_PROCESS_KIND_UTILITY => "utility",
+            _ => "other",
+        };
+        let mut pages = Vec::new();
         // Keep the collection alive while iterating: WebView2 154's iterator doesn't hold a
         // reference to it, and iterating after dropping it crashed in EmbeddedBrowserWebView.dll.
-        let collection = info.AssociatedFrameInfos().ok();
+        let collection = if kind == "renderer" { info.AssociatedFrameInfos().ok() } else { None };
         if let Some(iter) = collection.as_ref().and_then(|c| c.GetIterator().ok()) {
             let mut has = BOOL(0);
             while iter.HasCurrent(&mut has).is_ok() && has.as_bool() {
-                if let Some(info2) = iter.GetCurrent().ok().and_then(|f| f.cast::<ICoreWebView2FrameInfo2>().ok()) {
-                    let mut id = 0;
-                    if info2.FrameId(&mut id).is_ok() && id != 0 {
-                        frames.push(id);
+                if let Some(page) = iter.GetCurrent().ok().and_then(|f| main_frame_id(f)) {
+                    if !pages.contains(&page) {
+                        pages.push(page);
                     }
                 }
                 if iter.MoveNext(&mut has).is_err() {
@@ -886,9 +948,24 @@ unsafe fn read_renderers(infos: &ICoreWebView2ProcessExtendedInfoCollection) -> 
                 }
             }
         }
-        out.push((pid as u32, frames));
+        out.push(EngineProcess { pid: pid as u32, kind, pages });
     }
     out
+}
+
+/// The id of the main frame above `frame` (itself if it is one); None if a link has no id. The
+/// parents are a snapshot taken with the process list, so they agree with it.
+unsafe fn main_frame_id(frame: ICoreWebView2FrameInfo) -> Option<u32> {
+    let mut frame = frame.cast::<ICoreWebView2FrameInfo2>().ok()?;
+    // A depth cap, so a malformed chain can't spin the UI thread.
+    for _ in 0..32 {
+        match frame.ParentFrameInfo().ok().and_then(|p| p.cast::<ICoreWebView2FrameInfo2>().ok()) {
+            Some(parent) => frame = parent,
+            None => break,
+        }
+    }
+    let mut id = 0;
+    (frame.FrameId(&mut id).is_ok() && id != 0).then_some(id)
 }
 
 /// Answers requests to blocked domains with an empty 403 instead of letting them out.
