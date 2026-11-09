@@ -2044,16 +2044,24 @@ impl App {
                 }
             }
             // StateChanged can repeat; only a running download can finish.
-            DownloadState::Completed | DownloadState::Interrupted => {
+            DownloadState::Completed | DownloadState::Canceled | DownloadState::Interrupted => {
                 if !self.downloads_running.remove(&id) {
                     return;
                 }
             }
         }
-        debug!("download {id}: {state:?}");
-        if state == DownloadState::Completed {
-            self.last_download = Some(PathBuf::from(path));
-            self.ui.set_download_done(true);
+        debug!("download {id}: {state:?} {path}");
+        // The button's colour and dot are easy to miss; say it in words, with the file's name.
+        let path = PathBuf::from(path);
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        match state {
+            DownloadState::Completed => {
+                self.set_status(&format!("已下載 {name}"));
+                self.last_download = Some(path);
+                self.ui.set_download_done(true);
+            }
+            DownloadState::Interrupted => self.set_status(&format!("下載失敗：{name}")),
+            DownloadState::InProgress | DownloadState::Canceled => {}
         }
         self.ui.set_downloads_visible(true);
         self.ui.set_downloading(!self.downloads_running.is_empty());

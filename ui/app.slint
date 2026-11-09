@@ -1824,8 +1824,8 @@ export component AppWindow inherits Window {
                         width: 6px;
                     }
 
-                    // Chrome's download button: finished downloads wait behind it instead of a list
-                    // popping up over the page.
+                    // Chrome's download button: brings WebView2's download list back after it was
+                    // dismissed, and shows a download running or finished meanwhile.
                     if root.downloads-visible: Rectangle {
                         width: 34px;
                         height: 34px;

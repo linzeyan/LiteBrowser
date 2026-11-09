@@ -131,12 +131,39 @@ const MIN_RUNTIME_VERSION: &str = "100.0.1185.36";
 pub enum DownloadState {
     InProgress,
     Completed,
-    /// Failed or canceled; a resumed download reports InProgress again.
+    /// The user canceled it in the download list.
+    Canceled,
+    /// Failed (network, disk, blocked); a resumed download reports InProgress again.
     Interrupted,
 }
 
 /// Tells downloads apart.
 static NEXT_DOWNLOAD: AtomicU64 = AtomicU64::new(1);
+
+/// Posts where download `id` stands.
+fn report_download(id: u64, download: &ICoreWebView2DownloadOperation) -> windows::core::Result<()> {
+    let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
+    let mut path = PWSTR::null();
+    unsafe {
+        download.State(&mut state)?;
+        download.ResultFilePath(&mut path)?;
+    }
+    let state = match state {
+        COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS => DownloadState::InProgress,
+        COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED => DownloadState::Completed,
+        _ => {
+            let mut reason = COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON::default();
+            let _ = unsafe { download.InterruptReason(&mut reason) };
+            if reason == COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED {
+                DownloadState::Canceled
+            } else {
+                DownloadState::Interrupted
+            }
+        }
+    };
+    post(Event::Download { id, state, path: take_pwstr(path) });
+    Ok(())
+}
 
 fn post_engine(tab: TabId, event: EngineEvent) {
     post(Event::Engine(tab, event));
@@ -610,36 +637,35 @@ impl WebView {
                 )?;
             }
 
-            // Downloads: WebView2's list would pop up over the page for every one; the toolbar's
-            // download button reports them instead and opens the list when clicked.
+            // Downloads: watched for the toolbar's download button, but left to WebView2's own list.
+            // Hiding that list (Handled = true) also hides SmartScreen's "keep this file?" prompt for
+            // an .exe and the like: such a download then never finishes and keeps its file name
+            // taken, so the next one is saved as "name (1)" even after the file is deleted.
             // ICoreWebView2_4 (runtime 92).
             if let Ok(wv4) = core.cast::<ICoreWebView2_4>() {
                 wv4.add_DownloadStarting(
                     &DownloadStartingEventHandler::create(Box::new(move |_, args| {
                         let Some(args) = args else { return Ok(()) };
-                        args.SetHandled(true)?;
                         let download = args.DownloadOperation()?;
                         let id = NEXT_DOWNLOAD.fetch_add(1, Ordering::Relaxed);
+                        let mut path = PWSTR::null();
+                        args.ResultFilePath(&mut path)?;
+                        debug!("download {id} starting: {}", take_pwstr(path));
+                        // Always running first: the app lets only a running download finish, which
+                        // is how it drops the repeats StateChanged sends.
                         post(Event::Download { id, state: DownloadState::InProgress, path: String::new() });
                         let mut token = 0i64;
                         download.add_StateChanged(
-                            &StateChangedEventHandler::create(Box::new(move |sender, _| {
-                                let Some(download) = sender else { return Ok(()) };
-                                let mut state = COREWEBVIEW2_DOWNLOAD_STATE::default();
-                                download.State(&mut state)?;
-                                let mut path = PWSTR::null();
-                                download.ResultFilePath(&mut path)?;
-                                let state = match state {
-                                    COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED => DownloadState::Completed,
-                                    COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS => DownloadState::InProgress,
-                                    _ => DownloadState::Interrupted,
-                                };
-                                post(Event::Download { id, state, path: take_pwstr(path) });
-                                Ok(())
+                            &StateChangedEventHandler::create(Box::new(move |sender, _| match sender {
+                                Some(download) => report_download(id, &download),
+                                None => Ok(()),
                             })),
                             &mut token,
                         )?;
-                        Ok(())
+                        // DownloadStarting can come when the file is nearly or fully done
+                        // (WebView2Feedback#2890), and then no StateChanged ever follows; read where
+                        // it stands now as well.
+                        report_download(id, &download)
                     })),
                     &mut token,
                 )?;
